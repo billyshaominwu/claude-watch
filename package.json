@@ -1,0 +1,114 @@
+{
+  "name": "claude-watch",
+  "displayName": "Claude Watch",
+  "description": "Monitor your Claude Code sessions - see what each terminal is working on",
+  "version": "0.1.0",
+  "publisher": "billywu",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "claude-watch.newSession",
+        "title": "New Claude Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "claude-watch.refreshSessions",
+        "title": "Refresh",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claude-watch.openTerminal",
+        "title": "Open Terminal",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "claude-watch.pinSession",
+        "title": "Pin/Unpin Session",
+        "icon": "$(pin)"
+      },
+      {
+        "command": "claude-watch.resumeSession",
+        "title": "Resume Session",
+        "icon": "$(debug-start)"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claude-watch",
+          "title": "Claude Watch",
+          "icon": "$(comment-discussion)"
+        }
+      ]
+    },
+    "views": {
+      "claude-watch": [
+        {
+          "id": "claudeSessions",
+          "name": "Sessions",
+          "icon": "$(comment-discussion)",
+          "contextualTitle": "Claude Sessions"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "claude-watch.newSession",
+          "when": "view == claudeSessions",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claude-watch.refreshSessions",
+          "when": "view == claudeSessions",
+          "group": "navigation@2"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claude-watch.openTerminal",
+          "when": "view == claudeSessions && viewItem =~ /claudeSession|claudeAgent/",
+          "group": "inline@1"
+        },
+        {
+          "command": "claude-watch.pinSession",
+          "when": "view == claudeSessions && viewItem =~ /claudeSession|claudeAgent/",
+          "group": "inline@2"
+        },
+        {
+          "command": "claude-watch.resumeSession",
+          "when": "view == claudeSessions && viewItem == oldClaudeSession",
+          "group": "inline@1"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package",
+    "install-ext": "npm run compile && vsce package && code --install-extension claude-watch-0.1.0.vsix"
+  },
+  "devDependencies": {
+    "@electron/rebuild": "^4.0.2",
+    "@types/node": "^20.10.0",
+    "@types/vscode": "^1.85.0",
+    "@vscode/vsce": "^2.22.0",
+    "typescript": "^5.3.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/billywu/claude-watch"
+  }
+}
