@@ -387,10 +387,10 @@ class SessionItem extends vscode.TreeItem {
   private applySessionData(session: SessionState, hasChildren: boolean, isPinned: boolean = false): void {
     const isAgent = session.isAgent;
 
-    // Label: last user prompt with pin prefix for pinned sessions
+    // Label: prefer summary for stable context, fall back to firstUserMessage then lastUserPrompt
     const baseLabel = session.isCleared && session.isWaiting
       ? "New session"
-      : session.lastUserPrompt || "New session";
+      : session.summary || session.firstUserMessage || session.lastUserPrompt || "New session";
     this.label = isPinned ? `📌 ${baseLabel}` : baseLabel;
 
     // Main sessions are always expandable (can have context info + agents), agents are not
@@ -399,14 +399,16 @@ class SessionItem extends vscode.TreeItem {
       ? vscode.TreeItemCollapsibleState.Collapsed
       : vscode.TreeItemCollapsibleState.None;
 
-    // Description: in-progress task + completion progress
+    // Description: show in-progress task or last user prompt (dynamic activity)
     const completedCount = session.todos?.filter(t => t.status === 'completed').length ?? 0;
     const totalCount = session.todos?.length ?? 0;
     const progressText = totalCount > 0 ? ` (${completedCount}/${totalCount})` : '';
 
     this.description = session.inProgressTask
       ? truncate(session.inProgressTask, DESCRIPTION_TRUNCATE_LENGTH - progressText.length) + progressText
-      : (totalCount > 0 ? `${completedCount}/${totalCount} tasks` : "");
+      : session.lastUserPrompt
+        ? truncate(session.lastUserPrompt, DESCRIPTION_TRUNCATE_LENGTH - progressText.length) + progressText
+        : (totalCount > 0 ? `${completedCount}/${totalCount} tasks` : "");
 
     // Map status to display text
     const statusTextMap: Record<SessionStatus, string> = {
@@ -419,8 +421,10 @@ class SessionItem extends vscode.TreeItem {
     const tokenK = Math.round(session.contextTokens / 1000);
     const maxTokenK = Math.round(session.maxContextTokens / 1000);
 
+    const summaryLine = session.summary ? `**Summary:** ${session.summary}\n\n` : "";
     this.tooltip = new vscode.MarkdownString(
       `**${statusText}** in **${projectName}**\n\n` +
+      summaryLine +
       `**Context:** ${tokenK}K / ${maxTokenK}K tokens (${Math.round(session.contextTokens / session.maxContextTokens * 100)}%)\n\n` +
       `**Last prompt:** ${session.lastUserPrompt || "(none)"}\n\n` +
       `**Current task:** ${session.inProgressTask || "(none)"}\n\n` +
@@ -495,8 +499,8 @@ class OldSessionItem extends vscode.TreeItem {
   }
 
   private applySessionData(session: SessionState): void {
-    // Label: last user prompt or session identifier
-    this.label = session.lastUserPrompt || session.slug || "Old session";
+    // Label: prefer summary, fall back to first message, then last prompt
+    this.label = session.summary || session.firstUserMessage || session.lastUserPrompt || "Old session";
 
     // Description: relative time ago
     const ageMs = Date.now() - session.lastModified;
@@ -522,8 +526,11 @@ class OldSessionItem extends vscode.TreeItem {
 
     // Tooltip with details
     const projectName = path.basename(session.cwd) || session.cwd;
+    const summaryLine = session.summary ? `**Summary:** ${session.summary}\n\n` : "";
     this.tooltip = new vscode.MarkdownString(
       `**Old Session** in **${projectName}**\n\n` +
+      summaryLine +
+      `**First message:** ${session.firstUserMessage || "(none)"}\n\n` +
       `**Last prompt:** ${session.lastUserPrompt || "(none)"}\n\n` +
       `**Path:** ${session.cwd}\n\n` +
       `**Session ID:** ${session.sessionId}\n\n` +

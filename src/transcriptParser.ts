@@ -64,6 +64,8 @@ export interface SessionState {
   currentTask: string;
   inProgressTask: string;
   lastUserPrompt: string;
+  firstUserMessage: string; // The first user message in the session
+  summary: string; // Claude-generated summary of the session
   isWaiting: boolean;
   status: SessionStatus; // More granular: WORKING, PAUSED, or DONE
   lastModified: number;
@@ -89,6 +91,7 @@ interface TranscriptEntry {
   cwd?: string;
   agentId?: string;
   isSidechain?: boolean;
+  summary?: string; // Claude-generated summary of the session
   message?: {
     role?: string;
     model?: string;
@@ -172,6 +175,8 @@ export function parseTranscript(filePath: string): SessionState | null {
         currentTask: "Starting...",
         inProgressTask: "",
         lastUserPrompt: "",
+        firstUserMessage: "",
+        summary: "",
         isWaiting: true,
         status: SessionStatus.WORKING, // New session, considered working
         lastModified: stats.mtimeMs,
@@ -212,6 +217,8 @@ export function parseTranscript(filePath: string): SessionState | null {
     let lastAssistantText = "";
     // Track full todo list from last TodoWrite
     let currentTodos: TodoItem[] = [];
+    // Claude-generated summary of the session
+    let summary = "";
 
     for (const line of lines) {
       try {
@@ -234,6 +241,11 @@ export function parseTranscript(filePath: string): SessionState | null {
           // For agents, sessionId is actually the parent's session ID
           // Fall back to already-captured sessionId if this entry doesn't have it
           parentSessionId = entry.sessionId || sessionId || null;
+        }
+
+        // Extract Claude-generated summary
+        if (entry.type === "summary" && entry.summary) {
+          summary = entry.summary;
         }
 
         // Track entry type for waiting state (assistant entries only here, user entries below)
@@ -400,6 +412,8 @@ export function parseTranscript(filePath: string): SessionState | null {
       currentTask,
       inProgressTask: currentInProgressTask,
       lastUserPrompt,
+      firstUserMessage,
+      summary,
       isWaiting,
       status,
       lastModified: stats.mtimeMs,
