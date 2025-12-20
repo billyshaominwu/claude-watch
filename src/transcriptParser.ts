@@ -18,8 +18,14 @@ const FIRST_MESSAGE_TRUNCATE_LENGTH = 50; // Max length for first user message d
 /**
  * Derive the working directory from the project folder path.
  * Claude stores sessions in ~/.claude/projects/<encoded-path>/*.jsonl
- * where <encoded-path> is the cwd with '/' replaced by '-' and leading '-'
- * Example: -Users-billywu-claude-watch -> /Users/billywu/claude-watch
+ * where <encoded-path> is the cwd with '/' replaced by '-'
+ *
+ * The tricky part: paths containing hyphens (like /Users/foo/my-project)
+ * become ambiguous when encoded (-Users-foo-my-project).
+ * We can't know if "my-project" was one segment or two.
+ *
+ * Strategy: Return the folder name as-is (encoded form) and let the caller
+ * match against known CWDs using encodePathForClaude().
  */
 function deriveCwdFromPath(filePath: string): string {
   // Extract project folder name from path like:
@@ -33,8 +39,44 @@ function deriveCwdFromPath(filePath: string): string {
   if (!projectFolder || !projectFolder.startsWith("-")) {
     return "";
   }
-  // Convert "-Users-billywu-claude-watch" to "/Users/billywu/claude-watch"
-  return projectFolder.replace(/-/g, "/");
+
+  // Naive decode: replace all '-' with '/'
+  // This works for paths without hyphens in directory names
+  const naiveDecode = projectFolder.replace(/-/g, "/");
+
+  // Check if the path exists - if so, use it
+  try {
+    if (fs.existsSync(naiveDecode)) {
+      return naiveDecode;
+    }
+  } catch {
+    // Ignore errors
+  }
+
+  // If naive decode doesn't exist, try to find a valid path by checking
+  // different hyphen placements. Start from the end (most likely location for project name hyphens)
+  const parts = projectFolder.slice(1).split("-"); // Remove leading "-", split on "-"
+
+  // Try progressively merging parts from the end with hyphens
+  // e.g., for ["Users", "foo", "my", "project"], try:
+  //   /Users/foo/my-project, /Users/foo-my/project, etc.
+  for (let mergePoint = parts.length - 1; mergePoint >= 1; mergePoint--) {
+    const pathParts = [
+      ...parts.slice(0, mergePoint),
+      parts.slice(mergePoint).join("-")
+    ];
+    const candidate = "/" + pathParts.join("/");
+    try {
+      if (fs.existsSync(candidate)) {
+        return candidate;
+      }
+    } catch {
+      // Ignore errors
+    }
+  }
+
+  // Fallback to naive decode
+  return naiveDecode;
 }
 
 // Model context window sizes
@@ -61,26 +103,17 @@ export interface SessionState {
   sessionId: string;
   slug: string;
   cwd: string;
-  currentTask: string;
   inProgressTask: string;
   lastUserPrompt: string;
-  firstUserMessage: string; // The first user message in the session
-  summary: string; // Claude-generated summary of the session
-  isWaiting: boolean;
-  status: SessionStatus; // More granular: WORKING, PAUSED, or DONE
+  firstUserMessage: string;
+  summary: string;
+  status: SessionStatus;
   lastModified: number;
   created: number;
   filePath: string;
   isAgent: boolean;
   parentSessionId: string | null;
-  isCleared: boolean;
-  hasRealActivity: boolean; // true if agent has non-warmup user messages or tasks
-  // Token usage (kept for backwards compat)
-  contextTokens: number;
-  maxContextTokens: number;
-  // Detailed token stats
   tokenUsage: TokenUsage;
-  // Full todo list from last TodoWrite
   todos: TodoItem[];
 }
 
@@ -90,8 +123,7 @@ interface TranscriptEntry {
   slug?: string;
   cwd?: string;
   agentId?: string;
-  isSidechain?: boolean;
-  summary?: string; // Claude-generated summary of the session
+  summary?: string;
   message?: {
     role?: string;
     model?: string;
@@ -117,7 +149,6 @@ interface ContentItem {
 export interface TodoItem {
   content: string;
   status: string;
-  activeForm?: string;  // Optional: "Running tests..." form
 }
 
 export function parseTranscript(filePath: string): SessionState | null {
@@ -158,7 +189,6 @@ export function parseTranscript(filePath: string): SessionState | null {
     if (lines.length === 0) {
       const fileName = path.basename(filePath, ".jsonl");
       const isAgent = fileName.startsWith("agent-");
-      // Derive cwd from file path for new sessions that don't have it yet
       const derivedCwd = deriveCwdFromPath(filePath);
       const defaultTokenUsage: TokenUsage = {
         contextTokens: 0,
@@ -172,22 +202,16 @@ export function parseTranscript(filePath: string): SessionState | null {
         sessionId: fileName,
         slug: fileName.slice(0, 8),
         cwd: derivedCwd,
-        currentTask: "Starting...",
         inProgressTask: "",
         lastUserPrompt: "",
         firstUserMessage: "",
         summary: "",
-        isWaiting: true,
-        status: SessionStatus.WORKING, // New session, considered working
+        status: SessionStatus.DONE,
         lastModified: stats.mtimeMs,
         created: stats.birthtimeMs,
         filePath,
         isAgent,
         parentSessionId: null,
-        isCleared: false,
-        hasRealActivity: false,
-        contextTokens: 0,
-        maxContextTokens: MODEL_CONTEXT_WINDOWS.default,
         tokenUsage: defaultTokenUsage,
         todos: [],
       };
@@ -205,7 +229,6 @@ export function parseTranscript(filePath: string): SessionState | null {
     let isAgent = false;
     let parentSessionId: string | null = null;
     let isCleared = false;
-    let hasRealActivity = false; // Track if there's non-warmup user activity
     let contextTokens = 0;
     let inputTokens = 0;
     let cacheReadTokens = 0;
@@ -219,6 +242,10 @@ export function parseTranscript(filePath: string): SessionState | null {
     let currentTodos: TodoItem[] = [];
     // Claude-generated summary of the session
     let summary = "";
+    // Track if summary was found before or after user activity
+    // Summary from previous context appears before user messages and should be ignored
+    let foundUserActivity = false;
+    let summaryIsFromPreviousContext = false;
 
     for (const line of lines) {
       try {
@@ -244,8 +271,20 @@ export function parseTranscript(filePath: string): SessionState | null {
         }
 
         // Extract Claude-generated summary
+        // Only use summary if it appears AFTER user activity in the transcript
+        // Summaries from previous context continuation appear at the start (before user messages)
+        // and reflect the OLD session, not the current one
         if (entry.type === "summary" && entry.summary) {
-          summary = entry.summary;
+          if (foundUserActivity) {
+            // This summary was generated after user activity - it's valid
+            summary = entry.summary;
+            summaryIsFromPreviousContext = false;
+          } else {
+            // This summary appeared before any user messages - likely from previous context
+            // Store it but mark it as from previous context
+            summary = entry.summary;
+            summaryIsFromPreviousContext = true;
+          }
         }
 
         // Track entry type for waiting state (assistant entries only here, user entries below)
@@ -286,6 +325,7 @@ export function parseTranscript(filePath: string): SessionState | null {
                 if (content.length > USER_PROMPT_TRUNCATE_LENGTH) {
                   lastUserPrompt += "…";
                 }
+                foundUserActivity = true; // Mark that we've seen user activity for summary tracking
               }
             }
             // Command messages don't update lastEntryType - they don't affect waiting state
@@ -301,7 +341,7 @@ export function parseTranscript(filePath: string): SessionState | null {
               if (content.length > FIRST_MESSAGE_TRUNCATE_LENGTH) {
                 firstUserMessage += "…";
               }
-              hasRealActivity = true; // Found a real user message
+              foundUserActivity = true;
             }
           }
         }
@@ -317,7 +357,6 @@ export function parseTranscript(filePath: string): SessionState | null {
             for (const item of content) {
               if (item.type === "tool_use") {
                 lastEntryIsToolUse = true;
-                hasRealActivity = true; // Any tool use means real activity
                 // Track AskUserQuestion for Paused detection
                 if (item.name === "AskUserQuestion") {
                   lastAssistantHasAskUserQuestion = true;
@@ -363,28 +402,16 @@ export function parseTranscript(filePath: string): SessionState | null {
       }
     }
 
-    // Determine if waiting for user input
-    // Waiting = last entry is assistant AND not a tool use (Claude finished speaking)
-    // Also waiting if session was just cleared (no real user message yet)
-    // Also waiting if no user/assistant entries found (empty or metadata-only session)
-    const isWaiting = isCleared || lastEntryType === "" || (lastEntryType === "assistant" && !lastEntryIsToolUse);
-
-    // Determine session status (more granular than isWaiting)
+    // Determine session status based on last entry type
+    const isWaitingForInput = isCleared || lastEntryType === "" || (lastEntryType === "assistant" && !lastEntryIsToolUse);
     let status: SessionStatus;
-    if (!isWaiting) {
+    if (!isWaitingForInput) {
       status = SessionStatus.WORKING;
     } else if (lastAssistantHasAskUserQuestion || lastAssistantText.trimEnd().endsWith("?")) {
-      // Claude asked a question - waiting for user input
       status = SessionStatus.PAUSED;
     } else {
-      // Claude finished without asking - task is done
       status = SessionStatus.DONE;
     }
-
-    // Use in-progress task if available, otherwise first user message
-    // For agents without a meaningful task, show "Exploring..." since they're typically exploring the codebase
-    const defaultTask = isAgent ? "Exploring..." : "New session";
-    const currentTask = currentInProgressTask || firstUserMessage || defaultTask;
 
     // For agent sessions, use agentId as the identifier
     const effectiveSessionId = isAgent ? agentId : sessionId;
@@ -409,22 +436,16 @@ export function parseTranscript(filePath: string): SessionState | null {
       sessionId: effectiveSessionId,
       slug: slug || effectiveSessionId.slice(0, 8),
       cwd: effectiveCwd,
-      currentTask,
       inProgressTask: currentInProgressTask,
       lastUserPrompt,
       firstUserMessage,
-      summary,
-      isWaiting,
+      summary: summaryIsFromPreviousContext ? "" : summary,
       status,
       lastModified: stats.mtimeMs,
       created: stats.birthtimeMs,
       filePath,
       isAgent,
       parentSessionId,
-      isCleared,
-      hasRealActivity,
-      contextTokens,
-      maxContextTokens,
       tokenUsage,
       todos: currentTodos,
     };

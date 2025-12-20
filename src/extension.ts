@@ -1,40 +1,65 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { SessionManager } from "./sessionManager";
+import { HookServer } from "./hookServer";
+import { SessionRegistry } from "./sessionRegistry";
 import { SessionTreeProvider } from "./sessionTreeProvider";
-import { TerminalTracker } from "./terminalTracker";
-import { TerminalMatcher } from "./terminalMatcher";
-import { SessionProcessMap } from "./sessionProcessMap";
+import { configureHooks, areHooksConfigured } from "./hookConfig";
 
-let terminalTracker: TerminalTracker | null = null;
-let sessionManager: SessionManager | null = null;
+let hookServer: HookServer | null = null;
+let sessionRegistry: SessionRegistry | null = null;
 let sessionTreeProvider: SessionTreeProvider | null = null;
-let terminalMatcher: TerminalMatcher | null = null;
-let sessionProcessMap: SessionProcessMap | null = null;
+let outputChannel: vscode.OutputChannel | null = null;
 
-export function activate(context: vscode.ExtensionContext): void {
-  console.log("Claude Watch: Activating extension");
+export function log(message: string): void {
+  const timestamp = new Date().toISOString().slice(11, 23);
+  const line = `[${timestamp}] ${message}`;
+  console.log(`Claude Watch: ${message}`);
+  outputChannel?.appendLine(line);
+}
 
-  // Initialize TerminalTracker (monitors terminals and Claude processes)
-  terminalTracker = new TerminalTracker();
+export async function activate(context: vscode.ExtensionContext): Promise<void> {
+  // Create output channel for debugging
+  outputChannel = vscode.window.createOutputChannel("Claude Watch");
+  context.subscriptions.push(outputChannel);
 
-  // Initialize TerminalMatcher (matches sessions to terminals)
-  terminalMatcher = new TerminalMatcher(terminalTracker);
+  log("Activating extension");
+
+  // Configure hooks if not already configured
+  if (!areHooksConfigured()) {
+    log("Hooks not configured, setting up...");
+    const result = await configureHooks();
+    if (!result.success) {
+      vscode.window.showErrorMessage(
+        `Claude Watch: Failed to configure hooks: ${result.error}. The extension may not work correctly.`
+      );
+    } else {
+      log("Hooks configured successfully");
+    }
+  } else {
+    log("Hooks already configured");
+  }
+
+  // Start the hook server
+  hookServer = new HookServer();
+  try {
+    const port = await hookServer.start();
+    log(`Hook server started on port ${port}`);
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err);
+    vscode.window.showErrorMessage(
+      `Claude Watch: Failed to start hook server: ${error}`
+    );
+    return;
+  }
 
   // Get the current workspace path to filter sessions
   const workspacePath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 
-  // Initialize SessionProcessMap (persistent session→process mapping)
-  sessionProcessMap = new SessionProcessMap(context);
-
-  // Initialize SessionManager (watches session files)
-  sessionManager = new SessionManager(terminalTracker, sessionProcessMap, workspacePath);
-
-  // Connect terminalMatcher to sessionManager's mapping
-  terminalMatcher.setGetSessionMapping((filePath) => sessionManager?.getSessionMapping(filePath));
+  // Initialize SessionRegistry with context for persistence
+  sessionRegistry = new SessionRegistry(hookServer, workspacePath, context);
 
   // Initialize tree view
-  sessionTreeProvider = new SessionTreeProvider(sessionManager, context, terminalMatcher);
+  sessionTreeProvider = new SessionTreeProvider(sessionRegistry, context);
 
   // Register the tree view
   const treeView = vscode.window.createTreeView("claudeSessions", {
@@ -42,22 +67,27 @@ export function activate(context: vscode.ExtensionContext): void {
     showCollapseAll: false,
   });
 
-  // Connect session manager updates to tree view
-  sessionManager.onUpdate((sessions) => {
+  // Connect registry updates to tree view
+  sessionRegistry.onUpdate((sessions) => {
     if (sessionTreeProvider) {
       sessionTreeProvider.updateSessions(sessions);
     }
   });
 
-  // Connect session manager inactive updates to tree view
-  sessionManager.onInactiveUpdate((sessions) => {
+  // Connect registry inactive updates to tree view
+  sessionRegistry.onInactiveUpdate((sessions) => {
     if (sessionTreeProvider) {
       sessionTreeProvider.updateInactiveSessions(sessions);
     }
   });
 
   // Start watching for sessions
-  sessionManager.start();
+  sessionRegistry.start();
+
+  // Auto-detect any already running Claude sessions
+  sessionRegistry.refresh().catch((err) => {
+    log(`Error during initial refresh: ${err}`);
+  });
 
   // Register commands
   const newSessionCommand = vscode.commands.registerCommand(
@@ -82,7 +112,10 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const refreshCommand = vscode.commands.registerCommand(
     "claude-watch.refreshSessions",
-    () => {
+    async () => {
+      if (sessionRegistry) {
+        await sessionRegistry.refresh();
+      }
       if (sessionTreeProvider) {
         sessionTreeProvider.refresh();
       }
@@ -92,11 +125,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const openTerminalCommand = vscode.commands.registerCommand(
     "claude-watch.openTerminal",
     (item) => {
-      console.log("Claude Watch: openTerminal command triggered", item);
       if (sessionTreeProvider && item) {
         sessionTreeProvider.openTerminalForSession(item);
-      } else {
-        console.log("Claude Watch: No sessionTreeProvider or item", { sessionTreeProvider: !!sessionTreeProvider, item: !!item });
       }
     }
   );
@@ -138,53 +168,51 @@ export function activate(context: vscode.ExtensionContext): void {
     resumeSessionCommand
   );
 
+  // Listen for terminal close events to clean up sessions
+  // When a terminal is closed abruptly (not via /exit), the SessionEnd hook doesn't fire
+  const terminalCloseListener = vscode.window.onDidCloseTerminal(async () => {
+    // Small delay to allow process to fully terminate
+    setTimeout(async () => {
+      if (sessionRegistry) {
+        const cleaned = await sessionRegistry.cleanupOrphanedSessions();
+        if (cleaned > 0) {
+          log(`Cleaned ${cleaned} orphaned sessions after terminal close`);
+        }
+      }
+    }, 500);
+  });
+
   // Clean up on deactivation
   context.subscriptions.push({
     dispose: () => {
-      if (sessionManager) {
-        sessionManager.stop();
-        sessionManager = null;
+      if (sessionRegistry) {
+        sessionRegistry.stop();
+        sessionRegistry = null;
       }
-      if (sessionProcessMap) {
-        sessionProcessMap.flush();
-        sessionProcessMap = null;
-      }
-      if (terminalMatcher) {
-        terminalMatcher.dispose();
-        terminalMatcher = null;
-      }
-      if (terminalTracker) {
-        terminalTracker.dispose();
-        terminalTracker = null;
+      if (hookServer) {
+        hookServer.stop();
+        hookServer = null;
       }
       sessionTreeProvider = null;
     },
   });
 
-  console.log("Claude Watch: Extension activated successfully");
+  context.subscriptions.push(terminalCloseListener);
+
+  log("Extension activated successfully");
 }
 
 export function deactivate(): void {
-  console.log("Claude Watch: Deactivating extension");
+  log("Deactivating extension");
 
-  if (sessionManager) {
-    sessionManager.stop();
-    sessionManager = null;
+  if (sessionRegistry) {
+    sessionRegistry.stop();
+    sessionRegistry = null;
   }
 
-  if (sessionProcessMap) {
-    sessionProcessMap.flush();
-    sessionProcessMap = null;
-  }
-
-  if (terminalMatcher) {
-    terminalMatcher.dispose();
-    terminalMatcher = null;
-  }
-
-  if (terminalTracker) {
-    terminalTracker.dispose();
-    terminalTracker = null;
+  if (hookServer) {
+    hookServer.stop();
+    hookServer = null;
   }
 
   sessionTreeProvider = null;

@@ -4,14 +4,17 @@ A VS Code extension that monitors your Claude Code CLI sessions. See what each t
 
 ## Features
 
-- **Session Sidebar**: View all active Claude sessions in a dedicated panel
-- **Real-time Status**: See which sessions are working vs waiting for input
-- **Task Display**: Shows in-progress task from TodoWrite in the description
+- **Session Sidebar**: View all active Claude sessions in a dedicated panel with Active/Old categories
+- **Real-time Status**: Three states - Working (spinning), Paused (question asked), Done (task complete)
+- **Context Window Display**: Visual progress bar showing token usage with cache hit rate
+- **Task Tracking**: Shows in-progress tasks from TodoWrite with completion counts
+- **Todo List View**: Expandable session nodes showing individual todo items
 - **Agent Tracking**: Nested view of agent sub-sessions under parent sessions
+- **Session Pinning**: Pin important sessions to keep them at the top
+- **Session Resume**: Resume old sessions directly from the sidebar
 - **Quick Navigation**: Click any session to jump to its terminal
-- **Multi-Session Support**: Handles multiple Claude sessions in the same directory
+- **Session Summaries**: Shows Claude-generated summaries when available
 - **Workspace Filtering**: Only shows sessions for the current VS Code workspace
-- **Dynamic Title**: Panel title shows "X working, Y waiting" summary
 
 ## Installation
 
@@ -39,33 +42,61 @@ code --install-extension claude-watch-0.1.0.vsix
 1. Open the Claude Watch panel from the activity bar (chat bubble icon)
 2. Start Claude sessions in your terminals - they'll appear automatically
 3. Click a session to open its terminal
-4. Use the refresh button to manually update the list
+4. Expand a session to see context usage and todo items
+5. Use the refresh button to manually update the list
 
 ### Session Display
 
-- **Label**: Shows the last user prompt (or "New session" for cleared sessions)
-- **Description**: Shows the current in-progress task from TodoWrite
-- **Tooltip**: Hover for details including status, project, path, and session ID
+- **Label**: Shows session summary, first user message, or last prompt
+- **Description**: Current in-progress task with completion count (e.g., "3/5")
+- **Tooltip**: Hover for details including status, project, context usage, path, and session ID
 
 ### Session Status Icons
 
-- **Spinning sync icon**: Claude is working (executing tools)
-- **Pause icon**: Claude is waiting for user input
+- **Spinning sync icon** (blue): Claude is working (executing tools)
+- **Pause icon** (yellow): Claude asked a question, waiting for input
+- **Check icon** (green): Claude completed the task
+
+### Context Info (Expandable)
+
+- Visual progress bar with percentage
+- Token usage: current/max with cache hit rate
+- Output tokens count
 
 ### Tree View Actions
 
 - **+ button**: Start a new Claude session
 - **Refresh button**: Manually refresh session list
-- **Terminal icon**: Open terminal for session
-- **X button**: Remove session from list
+- **Terminal icon**: Open terminal for session (inline)
+- **Pin icon**: Pin/unpin session to top (inline)
+- **Play icon**: Resume old session (inline, on Old sessions)
 
 ## How It Works
 
-Claude Watch monitors `~/.claude/projects/` for session transcript files (JSONL format). It uses system commands (`ps`, `lsof`) to detect running Claude processes and match them to VS Code terminals by TTY.
+Claude Watch monitors `~/.claude/projects/` for session transcript files (JSONL format). It uses system commands (`ps`, `lsof`) to detect running Claude processes and match them to VS Code terminals.
 
-Sessions are considered "active" when:
-- A Claude process is running in the session's working directory
-- The session is one of the N most recently modified (where N = number of Claude processes in that directory)
+### Session-to-Process Mapping
+
+Sessions are associated with Claude processes using multiple strategies:
+1. **lsof lookup**: Find the process that has the session file open (most reliable)
+2. **Single process match**: If only one Claude process in the CWD, use it
+3. **Temporal matching**: Match by closest start time between session and process
+4. **Pending retry**: Queue for later if no process found yet
+
+Mappings are persisted to VS Code workspace state and validated against running processes.
+
+### Active vs Old Sessions
+
+**Active sessions** require:
+- A Claude process running in the session's CWD
+- The session must be among the N most recent (N = number of Claude processes in that directory)
+
+**Old sessions** are inactive sessions that can be resumed:
+- No running Claude process
+- Have a displayable user prompt
+- Click to resume with `claude --resume <sessionId>`
+
+### Agent Sessions
 
 Agent sessions (spawned via Task tool) are nested under their parent and only shown when:
 - The parent session is active

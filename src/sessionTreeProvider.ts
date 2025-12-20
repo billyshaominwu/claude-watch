@@ -1,8 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { SessionState, SessionStatus, TokenUsage, TodoItem } from "./transcriptParser";
-import { SessionManager } from "./sessionManager";
-import { TerminalMatcher } from "./terminalMatcher";
+import { SessionState, SessionStatus, TodoItem } from "./transcriptParser";
+import { SessionRegistry } from "./sessionRegistry";
 
 // Constants
 const DESCRIPTION_TRUNCATE_LENGTH = 60; // Max length for session description
@@ -18,8 +17,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
 
   private sessions: SessionState[] = [];
   private inactiveSessions: SessionState[] = [];
-  private sessionManager: SessionManager;
-  private terminalMatcher: TerminalMatcher;
+  private registry: SessionRegistry;
   private workspaceState: vscode.Memento;
   private pinnedSessions: Set<string> = new Set();
 
@@ -33,12 +31,10 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
   private oldCategoryItem: CategoryItem | null = null;
 
   constructor(
-    sessionManager: SessionManager,
-    context: vscode.ExtensionContext,
-    terminalMatcher: TerminalMatcher
+    registry: SessionRegistry,
+    context: vscode.ExtensionContext
   ) {
-    this.sessionManager = sessionManager;
-    this.terminalMatcher = terminalMatcher;
+    this.registry = registry;
     this.workspaceState = context.workspaceState;
     // Load pinned sessions from workspace state
     const savedPinned = this.workspaceState.get<string[]>('pinnedSessions', []);
@@ -226,10 +222,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
 
     // For agent sessions, find and use the parent session instead
     if (session.isAgent && session.parentSessionId) {
-      const parentSession = this.sessionManager.findSessionBySessionId(
-        session.parentSessionId,
-        true
-      );
+      const parentSession = this.registry.getParentSession(session);
       if (parentSession) {
         session = parentSession;
       } else {
@@ -242,21 +235,23 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
       }
     }
 
-    // Use TerminalMatcher to find and show the terminal
-    const shown = this.terminalMatcher.showTerminalForSession(session, this.sessions);
-    if (!shown) {
+    // Use SessionRegistry to find the terminal (direct PPID lookup)
+    const terminal = await this.registry.findTerminalForSessionState(session);
+    if (terminal) {
+      terminal.show();
+    } else {
       // No terminal found - offer to create one
       const result = await vscode.window.showInformationMessage(
         `No terminal found for session in ${session.cwd}. Open new terminal?`,
         "Open"
       );
       if (result === "Open") {
-        const terminal = vscode.window.createTerminal({
+        const newTerminal = vscode.window.createTerminal({
           name: `Claude: ${path.basename(session.cwd)}`,
           cwd: session.cwd,
         });
-        terminal.show();
-        terminal.sendText("claude");
+        newTerminal.show();
+        newTerminal.sendText("claude");
       }
     }
   }
@@ -277,10 +272,6 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
     // Persist to workspace state
     this.workspaceState.update('pinnedSessions', [...this.pinnedSessions]);
     this.refresh();
-  }
-
-  isPinned(filePath: string): boolean {
-    return this.pinnedSessions.has(filePath);
   }
 }
 
@@ -388,9 +379,21 @@ class SessionItem extends vscode.TreeItem {
     const isAgent = session.isAgent;
 
     // Label: prefer summary for stable context, fall back to firstUserMessage then lastUserPrompt
-    const baseLabel = session.isCleared && session.isWaiting
-      ? "New session"
-      : session.summary || session.firstUserMessage || session.lastUserPrompt || "New session";
+    // For sessions with no user activity yet:
+    // - If very recent (< 60s), show "New session"
+    // - If older, show summary (Claude loads previous context) or "Waiting for input..."
+    // This prevents old unused sessions from showing as "New session" forever
+    const hasUserActivity = session.firstUserMessage || session.lastUserPrompt;
+    const isVeryRecent = (Date.now() - session.created) < 60000; // 60 seconds
+    let baseLabel: string;
+    if (hasUserActivity) {
+      baseLabel = session.summary || session.firstUserMessage || session.lastUserPrompt || "New session";
+    } else if (isVeryRecent) {
+      baseLabel = "New session";
+    } else {
+      // Older session without user activity - show summary or waiting message
+      baseLabel = session.summary || "Waiting for input...";
+    }
     this.label = isPinned ? `📌 ${baseLabel}` : baseLabel;
 
     // Main sessions are always expandable (can have context info + agents), agents are not
@@ -418,14 +421,18 @@ class SessionItem extends vscode.TreeItem {
     };
     const statusText = statusTextMap[session.status] || "Unknown";
     const projectName = path.basename(session.cwd) || session.cwd;
-    const tokenK = Math.round(session.contextTokens / 1000);
-    const maxTokenK = Math.round(session.maxContextTokens / 1000);
+    const tokenK = Math.round(session.tokenUsage.contextTokens / 1000);
+    const maxTokenK = Math.round(session.tokenUsage.maxContextTokens / 1000);
 
     const summaryLine = session.summary ? `**Summary:** ${session.summary}\n\n` : "";
+    const usage = session.tokenUsage;
+    const contextPct = usage.maxContextTokens > 0
+      ? Math.round((usage.contextTokens / usage.maxContextTokens) * 100)
+      : 0;
     this.tooltip = new vscode.MarkdownString(
       `**${statusText}** in **${projectName}**\n\n` +
       summaryLine +
-      `**Context:** ${tokenK}K / ${maxTokenK}K tokens (${Math.round(session.contextTokens / session.maxContextTokens * 100)}%)\n\n` +
+      `**Context:** ${tokenK}K / ${maxTokenK}K tokens (${contextPct}%)\n\n` +
       `**Last prompt:** ${session.lastUserPrompt || "(none)"}\n\n` +
       `**Current task:** ${session.inProgressTask || "(none)"}\n\n` +
       `**Path:** ${session.cwd}\n\n` +
@@ -500,7 +507,11 @@ class OldSessionItem extends vscode.TreeItem {
 
   private applySessionData(session: SessionState): void {
     // Label: prefer summary, fall back to first message, then last prompt
-    this.label = session.summary || session.firstUserMessage || session.lastUserPrompt || "Old session";
+    // But only use summary if there's been real user activity
+    const hasUserActivity = session.firstUserMessage || session.lastUserPrompt;
+    this.label = hasUserActivity
+      ? (session.summary || session.firstUserMessage || session.lastUserPrompt)
+      : "Old session";
 
     // Description: relative time ago
     const ageMs = Date.now() - session.lastModified;
