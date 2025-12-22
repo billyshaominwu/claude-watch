@@ -81,10 +81,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   });
 
-  // Start watching for sessions
-  sessionRegistry.start();
+  // Start watching for sessions (waits for persisted sessions to restore)
+  await sessionRegistry.start();
 
-  // Auto-detect any already running Claude sessions
+  // Auto-detect any already running Claude sessions (runs after restore completes)
   sessionRegistry.refresh().catch((err) => {
     log(`Error during initial refresh: ${err}`);
   });
@@ -99,12 +99,18 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
-      // Create new terminal and start Claude
+      // Create terminal and track it
       const terminal = vscode.window.createTerminal({
         name: `Claude: ${path.basename(cwd)}`,
         cwd: cwd,
         iconPath: new vscode.ThemeIcon("comment-discussion"),
       });
+
+      // Register as pending before Claude starts (will be linked when hook fires)
+      if (sessionRegistry) {
+        sessionRegistry.registerPendingTerminal(terminal);
+      }
+
       terminal.show();
       terminal.sendText("claude");
     }
@@ -148,14 +154,30 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
       const session = item.session;
 
-      // Create new terminal and resume the session
+      // Create terminal and resume the session
       const terminal = vscode.window.createTerminal({
         name: `Claude: ${path.basename(session.cwd)}`,
         cwd: session.cwd,
         iconPath: new vscode.ThemeIcon("comment-discussion"),
       });
+
+      // Register as pending before Claude starts
+      if (sessionRegistry) {
+        sessionRegistry.registerPendingTerminal(terminal);
+      }
+
       terminal.show();
       terminal.sendText(`claude --resume ${session.sessionId}`);
+    }
+  );
+
+  const openSettingsCommand = vscode.commands.registerCommand(
+    "claude-watch.openSettings",
+    () => {
+      vscode.commands.executeCommand(
+        "workbench.action.openSettings",
+        "@ext:billywu.claude-watch"
+      );
     }
   );
 
@@ -165,21 +187,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     refreshCommand,
     openTerminalCommand,
     pinSessionCommand,
-    resumeSessionCommand
+    resumeSessionCommand,
+    openSettingsCommand
   );
 
   // Listen for terminal close events to clean up sessions
   // When a terminal is closed abruptly (not via /exit), the SessionEnd hook doesn't fire
-  const terminalCloseListener = vscode.window.onDidCloseTerminal(async () => {
-    // Small delay to allow process to fully terminate
-    setTimeout(async () => {
+  const terminalCloseListener = vscode.window.onDidCloseTerminal(async (terminal) => {
+    try {
+      // Clean up linked terminal tracking
       if (sessionRegistry) {
-        const cleaned = await sessionRegistry.cleanupOrphanedSessions();
-        if (cleaned > 0) {
-          log(`Cleaned ${cleaned} orphaned sessions after terminal close`);
-        }
+        sessionRegistry.handleTerminalClose(terminal);
       }
-    }, 500);
+
+      // Small delay to allow process to fully terminate
+      setTimeout(async () => {
+        if (sessionRegistry) {
+          const cleaned = await sessionRegistry.cleanupOrphanedSessions();
+          if (cleaned > 0) {
+            log(`Cleaned ${cleaned} orphaned sessions after terminal close`);
+          }
+        }
+      }, 500);
+    } catch (err) {
+      console.error("Claude Watch: Error in terminal close handler:", err);
+    }
   });
 
   // Clean up on deactivation

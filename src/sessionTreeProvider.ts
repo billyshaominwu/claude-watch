@@ -1,13 +1,16 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { SessionState, SessionStatus, TodoItem } from "./transcriptParser";
-import { SessionRegistry } from "./sessionRegistry";
+import { SessionRegistry, CurrentTool, RecentTool } from "./sessionRegistry";
+import { formatToolLabel, formatToolDescription, formatElapsedTime, getToolIcon } from "./toolFormatters";
 
 // Constants
 const DESCRIPTION_TRUNCATE_LENGTH = 60; // Max length for session description
+const MAX_VISIBLE_TOOLS = 5; // Number of recent tools to show before collapsing
+const MAX_VISIBLE_TODOS = 5; // Number of todos to show before collapsing
 
 // Base type for all tree items
-type TreeItemType = CategoryItem | SessionItem | OldSessionItem | ContextInfoItem | TodoListItem;
+type TreeItemType = CategoryItem | SessionItem | OldSessionItem | ContextInfoItem | TodoListItem | CurrentToolItem | ToolHistoryItem | ToolHistoryGroupItem | FileGroupItem | ToolsSectionItem | TasksSectionItem;
 
 export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType> {
   private _onDidChangeTreeData: vscode.EventEmitter<TreeItemType | undefined | null | void> =
@@ -129,9 +132,103 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
 
   getChildren(element?: TreeItemType): Thenable<TreeItemType[]> {
     if (element) {
-      // ContextInfoItem, TodoListItem, and OldSessionItem have no children
-      if (element instanceof ContextInfoItem || element instanceof TodoListItem || element instanceof OldSessionItem) {
+      // Leaf nodes: no children
+      if (element instanceof ContextInfoItem ||
+          element instanceof TodoListItem ||
+          element instanceof OldSessionItem ||
+          element instanceof CurrentToolItem ||
+          element instanceof ToolHistoryItem) {
         return Promise.resolve([]);
+      }
+
+      // ToolHistoryGroupItem: return its tools as ToolHistoryItems
+      if (element instanceof ToolHistoryGroupItem) {
+        return Promise.resolve(
+          element.tools.map((tool, i) =>
+            new ToolHistoryItem(tool, element.sessionFilePath, MAX_VISIBLE_TOOLS + i)
+          )
+        );
+      }
+
+      // FileGroupItem: return tools for that file
+      if (element instanceof FileGroupItem) {
+        return Promise.resolve(
+          element.tools.map((tool, i) =>
+            new ToolHistoryItem(tool, element.sessionFilePath, i)
+          )
+        );
+      }
+
+      // ToolsSectionItem: return tool children (file groups, tool items, overflow group)
+      if (element instanceof ToolsSectionItem) {
+        const children: TreeItemType[] = [];
+        const tools = element.tools;
+        const sessionFilePath = element.sessionFilePath;
+
+        // Group tools by file (for file operations)
+        const fileGroups = new Map<string, RecentTool[]>();
+        const nonFileTools: RecentTool[] = [];
+
+        for (const tool of tools) {
+          const filePath = getToolFilePath(tool);
+          if (filePath) {
+            const existing = fileGroups.get(filePath) || [];
+            existing.push(tool);
+            fileGroups.set(filePath, existing);
+          } else {
+            nonFileTools.push(tool);
+          }
+        }
+
+        // Show file groups (files with multiple operations get grouped)
+        let displayedCount = 0;
+        let fileGroupIndex = 0;
+        for (const [filePath, fileTools] of fileGroups) {
+          if (displayedCount >= MAX_VISIBLE_TOOLS) break;
+          if (fileTools.length > 1) {
+            children.push(new FileGroupItem(filePath, fileTools, sessionFilePath, fileGroupIndex++));
+            displayedCount++;
+          } else {
+            children.push(new ToolHistoryItem(fileTools[0], sessionFilePath, displayedCount));
+            displayedCount++;
+          }
+        }
+
+        // Show non-file tools (Bash, etc.)
+        for (const tool of nonFileTools) {
+          if (displayedCount >= MAX_VISIBLE_TOOLS) break;
+          children.push(new ToolHistoryItem(tool, sessionFilePath, displayedCount));
+          displayedCount++;
+        }
+
+        // Collapsed group for the rest
+        if (tools.length > MAX_VISIBLE_TOOLS) {
+          const hiddenTools = tools.slice(MAX_VISIBLE_TOOLS);
+          children.push(new ToolHistoryGroupItem(hiddenTools, sessionFilePath));
+        }
+
+        return Promise.resolve(children);
+      }
+
+      // TasksSectionItem: return todo children
+      if (element instanceof TasksSectionItem) {
+        const children: TreeItemType[] = [];
+        const todos = element.todos;
+        const sessionFilePath = element.sessionFilePath;
+
+        const MAX_COMPLETED_SHOWN = 3;
+        const inProgress = todos.filter(t => t.status === 'in_progress');
+        const pending = todos.filter(t => t.status === 'pending');
+        const completed = todos.filter(t => t.status === 'completed');
+
+        // Take only the last N completed (most recent are at end of array)
+        const recentCompleted = completed.slice(-MAX_COMPLETED_SHOWN);
+        const displayTodos = [...inProgress, ...pending, ...recentCompleted];
+
+        // Show all todos (no limit inside the section)
+        children.push(...displayTodos.map((t, i) => new TodoListItem(t, sessionFilePath, i)));
+
+        return Promise.resolve(children);
       }
 
       // CategoryItem: return sessions in that category
@@ -160,29 +257,33 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
         }
       }
 
-      // SessionItem: return context info, todos, then agent children
+      // SessionItem: return context info, tools section, tasks section, then agent children
       const session = element.session;
       const children: TreeItemType[] = [];
 
-      // 1. Context info first
-      children.push(this.getOrCreateContextItem(session));
+      // Get tool state from registry
+      const record = this.registry.getSessionRecord(session.sessionId);
 
-      // 2. Todo items (sorted: in_progress, pending, then limited completed)
-      if (session.todos && session.todos.length > 0) {
-        const MAX_COMPLETED_SHOWN = 3; // Only show N most recent completed
-
-        const inProgress = session.todos.filter(t => t.status === 'in_progress');
-        const pending = session.todos.filter(t => t.status === 'pending');
-        const completed = session.todos.filter(t => t.status === 'completed');
-
-        // Take only the last N completed (most recent are at end of array)
-        const recentCompleted = completed.slice(-MAX_COMPLETED_SHOWN);
-
-        const displayTodos = [...inProgress, ...pending, ...recentCompleted];
-        children.push(...displayTodos.map((t, i) => new TodoListItem(t, session.filePath, i)));
+      // 1. Current tool (if in progress) - most urgent, at top
+      if (record?.currentTool) {
+        children.push(new CurrentToolItem(record.currentTool, session.filePath));
       }
 
-      // 3. Agent children last
+      // 2. Context info (always show)
+      children.push(this.getOrCreateContextItem(session));
+
+      // 3. Tools section (collapsible)
+      if (record?.recentTools && record.recentTools.length > 0) {
+        children.push(new ToolsSectionItem(record.recentTools, session.filePath));
+      }
+
+      // 4. Tasks section (collapsible)
+      if (session.todos && session.todos.length > 0) {
+        const completedCount = session.todos.filter(t => t.status === 'completed').length;
+        children.push(new TasksSectionItem(session.todos, session.filePath, completedCount));
+      }
+
+      // 5. Agent children last
       const agents = this.getAgentChildren(session.sessionId);
       children.push(...agents.map((s) => this.getOrCreateSessionItem(s, false)));
 
@@ -213,8 +314,17 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
   }
 
   async openTerminalForSession(item: TreeItemType): Promise<void> {
-    // ContextInfoItem, TodoListItem, CategoryItem, and OldSessionItem don't open terminal via this method
-    if (item instanceof ContextInfoItem || item instanceof TodoListItem || item instanceof CategoryItem || item instanceof OldSessionItem) {
+    // Non-session items don't open terminal via this method
+    if (item instanceof ContextInfoItem ||
+        item instanceof TodoListItem ||
+        item instanceof CategoryItem ||
+        item instanceof OldSessionItem ||
+        item instanceof CurrentToolItem ||
+        item instanceof ToolHistoryItem ||
+        item instanceof ToolHistoryGroupItem ||
+        item instanceof FileGroupItem ||
+        item instanceof ToolsSectionItem ||
+        item instanceof TasksSectionItem) {
       return;
     }
 
@@ -235,30 +345,39 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
       }
     }
 
-    // Use SessionRegistry to find the terminal (direct PPID lookup)
-    const terminal = await this.registry.findTerminalForSessionState(session);
-    if (terminal) {
-      terminal.show();
-    } else {
-      // No terminal found - offer to create one
-      const result = await vscode.window.showInformationMessage(
-        `No terminal found for session in ${session.cwd}. Open new terminal?`,
-        "Open"
-      );
-      if (result === "Open") {
-        const newTerminal = vscode.window.createTerminal({
-          name: `Claude: ${path.basename(session.cwd)}`,
-          cwd: session.cwd,
-        });
-        newTerminal.show();
-        newTerminal.sendText("claude");
-      }
+    // Check for linked terminal first (fast O(1) lookup)
+    const linkedTerminal = this.registry.getLinkedTerminal(session.sessionId);
+    if (linkedTerminal) {
+      linkedTerminal.show();
+      return;
     }
+
+    // Fallback: search for terminal by PID ancestry (handles cases where lazy linking failed)
+    const foundTerminal = await this.registry.findTerminalForSession(session.sessionId);
+    if (foundTerminal) {
+      foundTerminal.show();
+      return;
+    }
+
+    // Terminal not found - may have been closed or started outside VS Code
+    vscode.window.showInformationMessage(
+      "Terminal not found. The session may have been started in another window or the terminal was closed.",
+      "OK"
+    );
   }
 
   pinSession(item: TreeItemType): void {
     // Only SessionItem can be pinned
-    if (item instanceof ContextInfoItem || item instanceof TodoListItem || item instanceof CategoryItem || item instanceof OldSessionItem) {
+    if (item instanceof ContextInfoItem ||
+        item instanceof TodoListItem ||
+        item instanceof CategoryItem ||
+        item instanceof OldSessionItem ||
+        item instanceof CurrentToolItem ||
+        item instanceof ToolHistoryItem ||
+        item instanceof ToolHistoryGroupItem ||
+        item instanceof FileGroupItem ||
+        item instanceof ToolsSectionItem ||
+        item instanceof TasksSectionItem) {
       return;
     }
 
@@ -557,6 +676,96 @@ class OldSessionItem extends vscode.TreeItem {
   }
 }
 
+/**
+ * Tree item showing currently executing tool with spinning icon
+ */
+class CurrentToolItem extends vscode.TreeItem {
+  public readonly sessionFilePath: string;
+
+  constructor(tool: CurrentTool, sessionFilePath: string) {
+    const label = formatToolLabel(tool.name, tool.input);
+    super(label, vscode.TreeItemCollapsibleState.None);
+
+    this.sessionFilePath = sessionFilePath;
+    this.id = `${sessionFilePath}:current-tool`;
+    this.contextValue = "currentTool";
+
+    // Use tool-specific icon with spinning animation
+    const iconConfig = getToolIcon(tool.name);
+    this.iconPath = new vscode.ThemeIcon(
+      `${iconConfig.icon}~spin`,
+      new vscode.ThemeColor(iconConfig.color || "charts.blue")
+    );
+
+    // Show elapsed time
+    this.description = formatElapsedTime(tool.startTime);
+
+    // Tooltip with full details
+    this.tooltip = new vscode.MarkdownString(
+      `**${tool.name}** (in progress)\n\n` +
+      `\`\`\`json\n${JSON.stringify(tool.input, null, 2)}\n\`\`\``
+    );
+  }
+}
+
+/**
+ * Tree item showing a completed tool execution
+ */
+class ToolHistoryItem extends vscode.TreeItem {
+  public readonly sessionFilePath: string;
+  public readonly tool: RecentTool;
+
+  constructor(tool: RecentTool, sessionFilePath: string, index: number) {
+    const label = formatToolLabel(tool.name, tool.input);
+    super(label, vscode.TreeItemCollapsibleState.None);
+
+    this.tool = tool;
+    this.sessionFilePath = sessionFilePath;
+    this.id = `${sessionFilePath}:tool:${index}`;
+    this.contextValue = "toolHistory";
+
+    // Use tool-specific icon (faded color for completed)
+    const iconConfig = getToolIcon(tool.name);
+    this.iconPath = new vscode.ThemeIcon(
+      iconConfig.icon,
+      new vscode.ThemeColor("descriptionForeground")
+    );
+
+    // Show duration
+    this.description = formatToolDescription(tool.name, tool.input, tool.result, tool.duration);
+
+    // Tooltip with full details
+    const resultStr = tool.result ? `\n\n**Result:**\n\`\`\`json\n${JSON.stringify(tool.result, null, 2).slice(0, 500)}...\n\`\`\`` : "";
+    this.tooltip = new vscode.MarkdownString(
+      `**${tool.name}** completed in ${this.description}\n\n` +
+      `**Input:**\n\`\`\`json\n${JSON.stringify(tool.input, null, 2)}\n\`\`\`` +
+      resultStr
+    );
+  }
+}
+
+/**
+ * Tree item showing collapsed group of older tool executions
+ */
+class ToolHistoryGroupItem extends vscode.TreeItem {
+  public readonly sessionFilePath: string;
+  public readonly tools: RecentTool[];
+
+  constructor(tools: RecentTool[], sessionFilePath: string) {
+    super(`+${tools.length} more tool uses`, vscode.TreeItemCollapsibleState.Collapsed);
+
+    this.tools = tools;
+    this.sessionFilePath = sessionFilePath;
+    this.id = `${sessionFilePath}:tool-group`;
+    this.contextValue = "toolHistoryGroup";
+
+    // History icon
+    this.iconPath = new vscode.ThemeIcon("history", new vscode.ThemeColor("descriptionForeground"));
+
+    this.description = "(expand to see)";
+  }
+}
+
 function truncate(str: string, maxLength: number): string {
   if (str.length > maxLength) {
     return str.slice(0, maxLength - 1) + "…";
@@ -579,3 +788,95 @@ function contextProgressBar(current: number, max: number, width: number = 8): st
   const pct = Math.round(percentage * 100);
   return `${bar} ${pct}%`;
 }
+
+/**
+ * Extract file path from tool input if it's a file operation
+ */
+function getToolFilePath(tool: RecentTool): string | null {
+  const input = tool.input as Record<string, unknown>;
+  if (tool.name === "Read" || tool.name === "Write" || tool.name === "Edit") {
+    return input.file_path as string || null;
+  }
+  if (tool.name === "NotebookEdit") {
+    return input.notebook_path as string || null;
+  }
+  return null;
+}
+
+/**
+ * Collapsible section containing all tool operations
+ */
+class ToolsSectionItem extends vscode.TreeItem {
+  public readonly tools: RecentTool[];
+  public readonly sessionFilePath: string;
+
+  constructor(tools: RecentTool[], sessionFilePath: string) {
+    super("Tools", vscode.TreeItemCollapsibleState.Collapsed);
+
+    this.tools = tools;
+    this.sessionFilePath = sessionFilePath;
+    this.id = `${sessionFilePath}:tools-section`;
+    this.contextValue = "toolsSection";
+
+    this.iconPath = new vscode.ThemeIcon("tools", new vscode.ThemeColor("descriptionForeground"));
+    this.description = `${tools.length} recent`;
+    this.tooltip = `${tools.length} tool operations in this session (click to expand)`;
+  }
+}
+
+/**
+ * Collapsible section containing all tasks/todos
+ */
+class TasksSectionItem extends vscode.TreeItem {
+  public readonly todos: TodoItem[];
+  public readonly sessionFilePath: string;
+
+  constructor(todos: TodoItem[], sessionFilePath: string, completedCount: number) {
+    super("Tasks", vscode.TreeItemCollapsibleState.Collapsed);
+
+    this.todos = todos;
+    this.sessionFilePath = sessionFilePath;
+    this.id = `${sessionFilePath}:tasks-section`;
+    this.contextValue = "tasksSection";
+
+    this.iconPath = new vscode.ThemeIcon("checklist", new vscode.ThemeColor("descriptionForeground"));
+    this.description = `${completedCount}/${todos.length} done`;
+    this.tooltip = `${todos.length} tasks (${completedCount} completed) - click to expand`;
+  }
+}
+
+/**
+ * Tree item grouping multiple operations on the same file
+ */
+class FileGroupItem extends vscode.TreeItem {
+  public readonly tools: RecentTool[];
+  public readonly sessionFilePath: string;
+  public readonly filePath: string;
+
+  constructor(filePath: string, tools: RecentTool[], sessionFilePath: string, index: number) {
+    const fileName = path.basename(filePath);
+    const toolNames = [...new Set(tools.map(t => t.name))].join(', ');
+    super(fileName, vscode.TreeItemCollapsibleState.Collapsed);
+
+    this.filePath = filePath;
+    this.tools = tools;
+    this.sessionFilePath = sessionFilePath;
+    // Use index-based ID to avoid issues with long file paths
+    this.id = `${sessionFilePath}:filegroup:${index}`;
+    this.contextValue = "fileGroup";
+
+    // File icon
+    this.iconPath = new vscode.ThemeIcon("file-code", new vscode.ThemeColor("charts.blue"));
+
+    // Description shows tool types
+    this.description = `${tools.length}× (${toolNames})`;
+
+    // Tooltip with full path
+    this.tooltip = new vscode.MarkdownString(
+      `**${fileName}**\n\n` +
+      `${tools.length} operations: ${toolNames}\n\n` +
+      `\`${filePath}\``
+    );
+  }
+}
+

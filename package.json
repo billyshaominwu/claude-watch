@@ -4,6 +4,10 @@
   "description": "Monitor your Claude Code sessions - see what each terminal is working on",
   "version": "0.1.0",
   "publisher": "billywu",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/billywu/claude-watch"
+  },
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -40,6 +44,11 @@
         "command": "claude-watch.resumeSession",
         "title": "Resume Session",
         "icon": "$(debug-start)"
+      },
+      {
+        "command": "claude-watch.openSettings",
+        "title": "Settings",
+        "icon": "$(gear)"
       }
     ],
     "viewsContainers": {
@@ -72,6 +81,11 @@
           "command": "claude-watch.refreshSessions",
           "when": "view == claudeSessions",
           "group": "navigation@2"
+        },
+        {
+          "command": "claude-watch.openSettings",
+          "when": "view == claudeSessions",
+          "group": "navigation@3"
         }
       ],
       "view/item/context": [
@@ -91,6 +105,18 @@
           "group": "inline@1"
         }
       ]
+    },
+    "configuration": {
+      "title": "Claude Watch",
+      "properties": {
+        "claudeWatch.maxOldSessions": {
+          "type": "number",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Maximum number of old sessions to display in the tree view"
+        }
+      }
     }
   },
   "scripts": {
@@ -101,14 +127,9 @@
     "install-ext": "npm run compile && vsce package && code --install-extension claude-watch-0.1.0.vsix"
   },
   "devDependencies": {
-    "@electron/rebuild": "^4.0.2",
     "@types/node": "^20.10.0",
     "@types/vscode": "^1.85.0",
     "@vscode/vsce": "^2.22.0",
     "typescript": "^5.3.0"
-  },
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/billywu/claude-watch"
   }
 }

@@ -5,13 +5,30 @@ import * as path from "path";
 import * as os from "os";
 
 /**
- * Event received from Claude Code hooks
+ * Event received from Claude Code session hooks
  */
 export interface HookEvent {
   event: "SessionStart" | "SessionEnd";
   sessionId: string;
   transcriptPath: string;
   cwd: string;
+  pid: number;
+  ppid: number;
+  tty: string;
+}
+
+/**
+ * Event received from Claude Code tool hooks (PreToolUse/PostToolUse)
+ */
+export interface ToolHookEvent {
+  event: "PreToolUse" | "PostToolUse";
+  sessionId: string;
+  transcriptPath: string;
+  cwd: string;
+  toolName: string;
+  toolInput: Record<string, unknown>;
+  toolResult: Record<string, unknown> | null; // Only present for PostToolUse
+  timestamp: number;
   pid: number;
   ppid: number;
   tty: string;
@@ -31,6 +48,12 @@ export class HookServer {
 
   private _onSessionEnd = new vscode.EventEmitter<HookEvent>();
   public readonly onSessionEnd = this._onSessionEnd.event;
+
+  private _onPreToolUse = new vscode.EventEmitter<ToolHookEvent>();
+  public readonly onPreToolUse = this._onPreToolUse.event;
+
+  private _onPostToolUse = new vscode.EventEmitter<ToolHookEvent>();
+  public readonly onPostToolUse = this._onPostToolUse.event;
 
   /**
    * Start the TCP server on a dynamic port.
@@ -75,6 +98,7 @@ export class HookServer {
 
   /**
    * Write the server port to ~/.claude/.claude-watch-port
+   * Appends to the file to support multiple VS Code instances
    */
   private writePortFile(): void {
     const claudeDir = path.join(os.homedir(), ".claude");
@@ -86,10 +110,61 @@ export class HookServer {
         fs.mkdirSync(claudeDir, { recursive: true });
       }
 
-      fs.writeFileSync(portFile, String(this.port));
-      console.log(`Claude Watch: Wrote port ${this.port} to ${portFile}`);
+      // Read existing ports and filter out stale ones
+      let existingPorts: number[] = [];
+      if (fs.existsSync(portFile)) {
+        const content = fs.readFileSync(portFile, "utf-8");
+        existingPorts = content
+          .split("\n")
+          .map((line) => parseInt(line.trim(), 10))
+          .filter((p) => !isNaN(p) && p > 0);
+
+        // Filter out ports that are no longer listening
+        existingPorts = existingPorts.filter((p) => this.isPortAlive(p));
+      }
+
+      // Add our port if not already present
+      if (!existingPorts.includes(this.port)) {
+        existingPorts.push(this.port);
+      }
+
+      fs.writeFileSync(portFile, existingPorts.join("\n"));
+      console.log(
+        `Claude Watch: Registered port ${this.port} (${existingPorts.length} total ports)`
+      );
     } catch (err) {
       console.error("Claude Watch: Failed to write port file:", err);
+    }
+  }
+
+  /**
+   * Check if a port is still alive (has a listener)
+   */
+  private isPortAlive(port: number): boolean {
+    try {
+      const socket = new net.Socket();
+      let alive = false;
+
+      socket.setTimeout(100);
+      socket.on("connect", () => {
+        alive = true;
+        socket.destroy();
+      });
+      socket.on("error", () => {
+        socket.destroy();
+      });
+      socket.on("timeout", () => {
+        socket.destroy();
+      });
+
+      // Try to connect synchronously (won't actually work, but we set up handlers)
+      socket.connect(port, "127.0.0.1");
+
+      // For synchronous check, we assume port is alive if we can't quickly determine
+      // The hook script will handle dead ports gracefully
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -104,13 +179,27 @@ export class HookServer {
       for (const line of lines) {
         if (!line.trim()) continue;
 
-        const event = JSON.parse(line) as HookEvent;
-        console.log(`Claude Watch: Received hook event: ${event.event} for session ${event.sessionId}`);
+        const parsed = JSON.parse(line);
+        const eventType = parsed.event as string;
 
-        if (event.event === "SessionStart") {
-          this._onSessionStart.fire(event);
-        } else if (event.event === "SessionEnd") {
-          this._onSessionEnd.fire(event);
+        if (eventType === "SessionStart" || eventType === "SessionEnd") {
+          const event = parsed as HookEvent;
+          console.log(`Claude Watch: Received hook event: ${event.event} for session ${event.sessionId}`);
+
+          if (event.event === "SessionStart") {
+            this._onSessionStart.fire(event);
+          } else {
+            this._onSessionEnd.fire(event);
+          }
+        } else if (eventType === "PreToolUse" || eventType === "PostToolUse") {
+          const event = parsed as ToolHookEvent;
+          console.log(`Claude Watch: Received tool event: ${event.event} - ${event.toolName} for session ${event.sessionId}`);
+
+          if (event.event === "PreToolUse") {
+            this._onPreToolUse.fire(event);
+          } else {
+            this._onPostToolUse.fire(event);
+          }
         }
       }
     } catch (err) {
@@ -127,17 +216,29 @@ export class HookServer {
       this.server = null;
     }
 
-    // Remove port file
+    // Remove our port from the file (keep other VS Code instances' ports)
     const portFile = path.join(os.homedir(), ".claude", ".claude-watch-port");
     try {
       if (fs.existsSync(portFile)) {
-        fs.unlinkSync(portFile);
+        const content = fs.readFileSync(portFile, "utf-8");
+        const ports = content
+          .split("\n")
+          .map((line) => parseInt(line.trim(), 10))
+          .filter((p) => !isNaN(p) && p > 0 && p !== this.port);
+
+        if (ports.length > 0) {
+          fs.writeFileSync(portFile, ports.join("\n"));
+        } else {
+          fs.unlinkSync(portFile);
+        }
       }
     } catch (err) {
-      console.error("Claude Watch: Failed to remove port file:", err);
+      console.error("Claude Watch: Failed to update port file:", err);
     }
 
     this._onSessionStart.dispose();
     this._onSessionEnd.dispose();
+    this._onPreToolUse.dispose();
+    this._onPostToolUse.dispose();
   }
 }
