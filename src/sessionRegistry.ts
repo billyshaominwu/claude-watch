@@ -231,6 +231,13 @@ export class SessionRegistry {
         continue;
       }
 
+      // Check if session can be linked to a VS Code terminal before restoring
+      const canLink = await this.canLinkToVSCodeTerminal(session.pid, session.ppid);
+      if (!canLink) {
+        log(`Session ${session.sessionId} filtered out - not started in VS Code terminal`);
+        continue;
+      }
+
       log(`Restoring session ${session.sessionId} (pid=${session.pid})`);
 
       const record: SessionRecord = {
@@ -606,6 +613,17 @@ export class SessionRegistry {
   private async tryLazyLink(sessionId: string, ppid: number): Promise<void> {
     const record = this.activeSessions.get(sessionId);
 
+    // Collect terminal PIDs for logging
+    const terminalPids: number[] = [];
+    for (const terminal of vscode.window.terminals) {
+      try {
+        const pid = await terminal.processId;
+        if (pid) terminalPids.push(pid);
+      } catch {
+        // ignore
+      }
+    }
+
     // First, try direct PPID lookup
     for (const terminal of vscode.window.terminals) {
       try {
@@ -647,10 +665,52 @@ export class SessionRegistry {
             // Terminal may have closed, ignore
           }
         }
+
+        // Log failure with details
+        log(`tryLazyLink FAILED for session ${sessionId}: ppid=${ppid}, pid=${record.pid}, ancestors=[${[...ancestorPids].join(',')}], terminalPids=[${terminalPids.join(',')}]`);
       } catch {
         // Ignore errors in fallback
       }
+    } else {
+      log(`tryLazyLink FAILED for session ${sessionId}: ppid=${ppid}, no pid in record, terminalPids=[${terminalPids.join(',')}]`);
     }
+  }
+
+  /**
+   * Check if a session can be linked to a VS Code terminal.
+   * Returns true if the session's PPID matches a terminal or if any ancestor is a terminal.
+   */
+  private async canLinkToVSCodeTerminal(pid: number, ppid: number): Promise<boolean> {
+    // Check direct PPID match first
+    for (const terminal of vscode.window.terminals) {
+      try {
+        const terminalPid = await terminal.processId;
+        if (terminalPid === ppid) {
+          return true;
+        }
+      } catch {
+        // Terminal may have closed, ignore
+      }
+    }
+
+    // Check if any ancestor is a VS Code terminal
+    try {
+      const ancestorPids = await this.getProcessAncestors(pid);
+      for (const terminal of vscode.window.terminals) {
+        try {
+          const terminalPid = await terminal.processId;
+          if (terminalPid && ancestorPids.has(terminalPid)) {
+            return true;
+          }
+        } catch {
+          // Terminal may have closed, ignore
+        }
+      }
+    } catch {
+      // Ignore errors
+    }
+
+    return false;
   }
 
   /**
@@ -749,12 +809,27 @@ export class SessionRegistry {
    */
   public async findTerminalForSession(sessionId: string): Promise<vscode.Terminal | undefined> {
     const record = this.activeSessions.get(sessionId);
-    if (!record) return undefined;
+    if (!record) {
+      log(`findTerminalForSession: no record for session ${sessionId}`);
+      return undefined;
+    }
+
+    // Collect terminal PIDs for logging
+    const terminalPids: number[] = [];
+    for (const terminal of vscode.window.terminals) {
+      try {
+        const pid = await terminal.processId;
+        if (pid) terminalPids.push(pid);
+      } catch {
+        // ignore
+      }
+    }
 
     // First, try direct PPID lookup (works when hook registered the session)
     for (const terminal of vscode.window.terminals) {
       const terminalPid = await terminal.processId;
       if (terminalPid === record.ppid) {
+        log(`findTerminalForSession: found via direct PPID match for session ${sessionId}`);
         return terminal;
       }
     }
@@ -773,12 +848,18 @@ export class SessionRegistry {
             this.ppidIndex.delete(record.ppid);
             record.ppid = terminalPid;
             this.ppidIndex.set(terminalPid, sessionId);
+            log(`findTerminalForSession: found via ancestor search for session ${sessionId}`);
             return terminal;
           }
         }
-      } catch {
-        // Ignore errors in fallback
+
+        // Log failure with details
+        log(`findTerminalForSession FAILED for session ${sessionId}: ppid=${record.ppid}, pid=${record.pid}, ancestors=[${[...ancestorPids].join(',')}], terminalPids=[${terminalPids.join(',')}]`);
+      } catch (err) {
+        log(`findTerminalForSession error for session ${sessionId}: ${err}`);
       }
+    } else {
+      log(`findTerminalForSession FAILED for session ${sessionId}: ppid=${record.ppid}, no pid in record`);
     }
 
     return undefined;

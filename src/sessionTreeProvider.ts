@@ -294,11 +294,23 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
     const mainSessions = this.getMainSessions();
     const categories: TreeItemType[] = [];
 
+    // Calculate status counts for active sessions
+    const statusCounts: StatusCounts = { working: 0, paused: 0, done: 0 };
+    for (const session of mainSessions) {
+      if (session.status === SessionStatus.WORKING) {
+        statusCounts.working++;
+      } else if (session.status === SessionStatus.PAUSED) {
+        statusCounts.paused++;
+      } else if (session.status === SessionStatus.DONE) {
+        statusCounts.done++;
+      }
+    }
+
     // Active category
     if (!this.activeCategoryItem) {
-      this.activeCategoryItem = new CategoryItem('active', 'Active', mainSessions.length);
+      this.activeCategoryItem = new CategoryItem('active', 'Active', mainSessions.length, statusCounts);
     } else {
-      this.activeCategoryItem.updateCount(mainSessions.length);
+      this.activeCategoryItem.updateCount(mainSessions.length, statusCounts);
     }
     categories.push(this.activeCategoryItem);
 
@@ -581,12 +593,21 @@ class SessionItem extends vscode.TreeItem {
 }
 
 /**
+ * Status counts for active sessions
+ */
+interface StatusCounts {
+  working: number;
+  paused: number;
+  done: number;
+}
+
+/**
  * Category item for grouping active and old sessions
  */
 class CategoryItem extends vscode.TreeItem {
   public readonly category: 'active' | 'old';
 
-  constructor(category: 'active' | 'old', label: string, count: number) {
+  constructor(category: 'active' | 'old', label: string, count: number, statusCounts?: StatusCounts) {
     // Active is expanded by default, Old is collapsed
     const collapsibleState = category === 'active'
       ? vscode.TreeItemCollapsibleState.Expanded
@@ -595,14 +616,29 @@ class CategoryItem extends vscode.TreeItem {
     this.category = category;
     this.id = `category:${category}`;
     this.contextValue = 'category';
-    this.updateCount(count);
+    this.updateCount(count, statusCounts);
     this.iconPath = category === 'active'
       ? new vscode.ThemeIcon('play-circle', new vscode.ThemeColor('charts.blue'))
       : new vscode.ThemeIcon('history', new vscode.ThemeColor('descriptionForeground'));
   }
 
-  updateCount(count: number): void {
-    this.description = `${count} session${count !== 1 ? 's' : ''}`;
+  updateCount(count: number, statusCounts?: StatusCounts): void {
+    if (this.category === 'active' && statusCounts && count > 0) {
+      // Show status breakdown for active sessions
+      const parts: string[] = [];
+      if (statusCounts.working > 0) {
+        parts.push(`${statusCounts.working} working`);
+      }
+      if (statusCounts.paused > 0) {
+        parts.push(`${statusCounts.paused} paused`);
+      }
+      if (statusCounts.done > 0) {
+        parts.push(`${statusCounts.done} done`);
+      }
+      this.description = parts.length > 0 ? parts.join(' · ') : `${count} session${count !== 1 ? 's' : ''}`;
+    } else {
+      this.description = `${count} session${count !== 1 ? 's' : ''}`;
+    }
   }
 }
 

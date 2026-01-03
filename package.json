@@ -65,8 +65,7 @@
         {
           "id": "claudeSessions",
           "name": "Sessions",
-          "icon": "$(comment-discussion)",
-          "contextualTitle": "Claude Sessions"
+          "icon": "$(comment-discussion)"
         }
       ]
     },
