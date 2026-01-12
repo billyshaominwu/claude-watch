@@ -7,7 +7,7 @@ import { promisify } from "util";
 
 const execAsync = promisify(exec);
 import { HookServer, HookEvent, ToolHookEvent } from "./hookServer";
-import { parseTranscript, SessionState } from "./transcriptParser";
+import { parseTranscript, SessionState, SessionStatus } from "./transcriptParser";
 import { cwdEquals } from "./utils";
 import { log } from "./extension";
 
@@ -18,6 +18,7 @@ const MAX_INACTIVE_SESSIONS = 500; // Limit stored inactive sessions to prevent 
 const MAX_RECENT_TOOLS = 15; // Limit recent tools per session to prevent memory leak
 const STALE_TOOL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes - clear currentTool if no PostToolUse
 const MAX_PENDING_TERMINALS = 50; // Limit pending terminals to prevent memory leak
+const ACTIVITY_THRESHOLD_MS = 10000; // 10 seconds - consider session active if modified recently
 
 /**
  * Current tool being executed
@@ -57,6 +58,8 @@ export interface SessionRecord {
   // Tool execution state (from hooks)
   currentTool?: CurrentTool;
   recentTools: RecentTool[];
+  // Activity tracking
+  lastActivityTime: number; // Last time we saw activity (tool use, JSONL update)
 }
 
 /**
@@ -250,6 +253,7 @@ export class SessionRegistry {
         pidStartTime: session.pidStartTime || null,
         state: null,
         recentTools: [],
+        lastActivityTime: Date.now(), // Will be updated when transcript is parsed
       };
 
       this.activeSessions.set(session.sessionId, record);
@@ -378,6 +382,7 @@ export class SessionRegistry {
       pidStartTime: null, // Will be captured async below
       state: existingState,
       recentTools: [],
+      lastActivityTime: Date.now(),
     };
 
     // Store and index
@@ -461,6 +466,9 @@ export class SessionRegistry {
         clearTimeout(record.currentTool.staleTimer);
       }
 
+      // Update activity time
+      record.lastActivityTime = Date.now();
+
       // Set current tool with stale timer
       record.currentTool = {
         name: event.toolName,
@@ -494,6 +502,9 @@ export class SessionRegistry {
       }
 
       log(`PostToolUse: ${event.toolName} for session ${event.sessionId}`);
+
+      // Update activity time
+      record.lastActivityTime = Date.now();
 
       // Calculate duration
       const duration = record.currentTool
@@ -739,7 +750,25 @@ export class SessionRegistry {
         if (!parentActive) continue;
       }
 
-      sessions.push(record.state);
+      // Compute effective status using multiple signals
+      let effectiveStatus = record.state.status;
+
+      // Signal 1: Hook says tool is running → definitely WORKING
+      if (record.currentTool) {
+        effectiveStatus = SessionStatus.WORKING;
+      }
+      // Signal 2: In-progress todo → Claude is actively working
+      else if (record.state.todos?.some(t => t.status === 'in_progress')) {
+        effectiveStatus = SessionStatus.WORKING;
+      }
+      // Signal 3: Recent file modification → likely still working
+      else if (Date.now() - record.state.lastModified < ACTIVITY_THRESHOLD_MS) {
+        effectiveStatus = SessionStatus.WORKING;
+      }
+      // Otherwise: use transcript-derived status (DONE or PAUSED)
+
+      // Push state with effective status
+      sessions.push({ ...record.state, status: effectiveStatus });
     }
 
     console.log(`Claude Watch: getActiveSessions() returning ${sessions.length} sessions`);

@@ -6,7 +6,7 @@ import { formatToolLabel, formatToolDescription, formatElapsedTime, getToolIcon 
 
 // Constants
 const DESCRIPTION_TRUNCATE_LENGTH = 60; // Max length for session description
-const MAX_VISIBLE_TOOLS = 5; // Number of recent tools to show before collapsing
+const MAX_VISIBLE_TOOLS = 3; // Number of recent tools to show before collapsing
 const MAX_VISIBLE_TODOS = 5; // Number of todos to show before collapsing
 
 // Base type for all tree items
@@ -23,6 +23,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
   private registry: SessionRegistry;
   private workspaceState: vscode.Memento;
   private pinnedSessions: Set<string> = new Set();
+  private sessionAliases: Map<string, string> = new Map(); // sessionId -> alias
 
   // Cache tree items by filePath to ensure stable object references across refreshes
   private sessionItemCache: Map<string, SessionItem> = new Map();
@@ -42,6 +43,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
     // Load pinned sessions from workspace state
     const savedPinned = this.workspaceState.get<string[]>('pinnedSessions', []);
     this.pinnedSessions = new Set(savedPinned);
+    // Load session aliases from workspace state
+    const savedAliases = this.workspaceState.get<Record<string, string>>('sessionAliases', {});
+    this.sessionAliases = new Map(Object.entries(savedAliases));
   }
 
   refresh(): void {
@@ -88,15 +92,43 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
   }
 
   /**
+   * Compute aggregate stats for history/inactive sessions
+   */
+  private computeHistoryStats(): HistoryStats {
+    let totalTokens = 0;
+    for (const session of this.inactiveSessions) {
+      totalTokens += session.tokenUsage.totalOutputTokens;
+    }
+    return {
+      sessionCount: this.inactiveSessions.length,
+      totalTokens
+    };
+  }
+
+  /**
+   * Compute aggregate token count for active sessions
+   */
+  private computeActiveTokens(): number {
+    let totalTokens = 0;
+    for (const session of this.sessions) {
+      totalTokens += session.tokenUsage.contextTokens;
+    }
+    return totalTokens;
+  }
+
+  /**
    * Get or create a cached SessionItem, updating its properties from the session state
    */
   private getOrCreateSessionItem(session: SessionState, hasChildren: boolean): SessionItem {
     const isPinned = this.pinnedSessions.has(session.filePath);
+    const alias = this.sessionAliases.get(session.sessionId);
+    const record = this.registry.getSessionRecord(session.sessionId);
+    const lastActivityTime = record?.lastActivityTime;
     let item = this.sessionItemCache.get(session.filePath);
     if (item) {
-      item.updateFromSession(session, hasChildren, isPinned);
+      item.updateFromSession(session, hasChildren, isPinned, alias, lastActivityTime);
     } else {
-      item = new SessionItem(session, hasChildren, isPinned);
+      item = new SessionItem(session, hasChildren, isPinned, alias, lastActivityTime);
       this.sessionItemCache.set(session.filePath, item);
     }
     return item;
@@ -145,7 +177,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
       if (element instanceof ToolHistoryGroupItem) {
         return Promise.resolve(
           element.tools.map((tool, i) =>
-            new ToolHistoryItem(tool, element.sessionFilePath, MAX_VISIBLE_TOOLS + i)
+            new ToolHistoryItem(tool, element.sessionFilePath, MAX_VISIBLE_TOOLS + i, "overflow")
           )
         );
       }
@@ -154,7 +186,7 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
       if (element instanceof FileGroupItem) {
         return Promise.resolve(
           element.tools.map((tool, i) =>
-            new ToolHistoryItem(tool, element.sessionFilePath, i)
+            new ToolHistoryItem(tool, element.sessionFilePath, i, "file")
           )
         );
       }
@@ -164,6 +196,9 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
         const children: TreeItemType[] = [];
         const tools = element.tools;
         const sessionFilePath = element.sessionFilePath;
+
+        // Track which tools have been displayed
+        const displayedTools = new Set<RecentTool>();
 
         // Group tools by file (for file operations)
         const fileGroups = new Map<string, RecentTool[]>();
@@ -187,23 +222,25 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
           if (displayedCount >= MAX_VISIBLE_TOOLS) break;
           if (fileTools.length > 1) {
             children.push(new FileGroupItem(filePath, fileTools, sessionFilePath, fileGroupIndex++));
-            displayedCount++;
+            fileTools.forEach(t => displayedTools.add(t));
           } else {
-            children.push(new ToolHistoryItem(fileTools[0], sessionFilePath, displayedCount));
-            displayedCount++;
+            children.push(new ToolHistoryItem(fileTools[0], sessionFilePath, displayedCount, "section"));
+            displayedTools.add(fileTools[0]);
           }
+          displayedCount++;
         }
 
         // Show non-file tools (Bash, etc.)
         for (const tool of nonFileTools) {
           if (displayedCount >= MAX_VISIBLE_TOOLS) break;
-          children.push(new ToolHistoryItem(tool, sessionFilePath, displayedCount));
+          children.push(new ToolHistoryItem(tool, sessionFilePath, displayedCount, "section"));
+          displayedTools.add(tool);
           displayedCount++;
         }
 
-        // Collapsed group for the rest
-        if (tools.length > MAX_VISIBLE_TOOLS) {
-          const hiddenTools = tools.slice(MAX_VISIBLE_TOOLS);
+        // Collapsed group for tools NOT yet displayed
+        const hiddenTools = tools.filter(t => !displayedTools.has(t));
+        if (hiddenTools.length > 0) {
           children.push(new ToolHistoryGroupItem(hiddenTools, sessionFilePath));
         }
 
@@ -257,33 +294,70 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
         }
       }
 
-      // SessionItem: return context info, tools section, tasks section, then agent children
+      // SessionItem: return tools, tasks section, then agent children
+      // (Context info is now inlined in the session description)
       const session = element.session;
       const children: TreeItemType[] = [];
 
       // Get tool state from registry
       const record = this.registry.getSessionRecord(session.sessionId);
 
-      // 1. Current tool (if in progress) - most urgent, at top
+      // 1. Current tool (if in progress)
       if (record?.currentTool) {
         children.push(new CurrentToolItem(record.currentTool, session.filePath));
       }
 
-      // 2. Context info (always show)
-      children.push(this.getOrCreateContextItem(session));
-
-      // 3. Tools section (collapsible)
+      // 2. Recent tools (show first 3 directly, rest in "More tools..." section)
       if (record?.recentTools && record.recentTools.length > 0) {
-        children.push(new ToolsSectionItem(record.recentTools, session.filePath));
+        const visibleTools = record.recentTools.slice(0, MAX_VISIBLE_TOOLS);
+        const overflowTools = record.recentTools.slice(MAX_VISIBLE_TOOLS);
+
+        // Group visible tools by file (for file operations)
+        const fileGroups = new Map<string, RecentTool[]>();
+        const nonFileTools: RecentTool[] = [];
+
+        for (const tool of visibleTools) {
+          const filePath = getToolFilePath(tool);
+          if (filePath) {
+            const existing = fileGroups.get(filePath) || [];
+            existing.push(tool);
+            fileGroups.set(filePath, existing);
+          } else {
+            nonFileTools.push(tool);
+          }
+        }
+
+        // Show file groups (files with multiple operations get grouped)
+        let displayedCount = 0;
+        let fileGroupIndex = 0;
+        for (const [filePath, fileTools] of fileGroups) {
+          if (fileTools.length > 1) {
+            children.push(new FileGroupItem(filePath, fileTools, session.filePath, fileGroupIndex++));
+          } else {
+            children.push(new ToolHistoryItem(fileTools[0], session.filePath, displayedCount));
+          }
+          displayedCount++;
+        }
+
+        // Show non-file tools (Bash, etc.)
+        for (const tool of nonFileTools) {
+          children.push(new ToolHistoryItem(tool, session.filePath, displayedCount));
+          displayedCount++;
+        }
+
+        // Put remaining tools in a collapsed "More tools..." section
+        if (overflowTools.length > 0) {
+          children.push(new ToolsSectionItem(overflowTools, session.filePath));
+        }
       }
 
-      // 4. Tasks section (collapsible)
+      // 3. Tasks section (collapsible)
       if (session.todos && session.todos.length > 0) {
         const completedCount = session.todos.filter(t => t.status === 'completed').length;
         children.push(new TasksSectionItem(session.todos, session.filePath, completedCount));
       }
 
-      // 5. Agent children last
+      // 4. Agent children last
       const agents = this.getAgentChildren(session.sessionId);
       children.push(...agents.map((s) => this.getOrCreateSessionItem(s, false)));
 
@@ -307,18 +381,20 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
     }
 
     // Active category
+    const activeTokens = this.computeActiveTokens();
     if (!this.activeCategoryItem) {
-      this.activeCategoryItem = new CategoryItem('active', 'Active', mainSessions.length, statusCounts);
+      this.activeCategoryItem = new CategoryItem('active', 'Active', mainSessions.length, statusCounts, undefined, activeTokens);
     } else {
-      this.activeCategoryItem.updateCount(mainSessions.length, statusCounts);
+      this.activeCategoryItem.updateCount(mainSessions.length, statusCounts, undefined, activeTokens);
     }
     categories.push(this.activeCategoryItem);
 
-    // Old category
+    // History category (old/inactive sessions)
+    const historyStats = this.computeHistoryStats();
     if (!this.oldCategoryItem) {
-      this.oldCategoryItem = new CategoryItem('old', 'Old', this.inactiveSessions.length);
+      this.oldCategoryItem = new CategoryItem('old', 'History', this.inactiveSessions.length, undefined, historyStats);
     } else {
-      this.oldCategoryItem.updateCount(this.inactiveSessions.length);
+      this.oldCategoryItem.updateCount(this.inactiveSessions.length, undefined, historyStats);
     }
     categories.push(this.oldCategoryItem);
 
@@ -403,6 +479,49 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
     // Persist to workspace state
     this.workspaceState.update('pinnedSessions', [...this.pinnedSessions]);
     this.refresh();
+  }
+
+  async renameSession(item: TreeItemType): Promise<void> {
+    // Only SessionItem can be renamed
+    if (item instanceof ContextInfoItem ||
+        item instanceof TodoListItem ||
+        item instanceof CategoryItem ||
+        item instanceof OldSessionItem ||
+        item instanceof CurrentToolItem ||
+        item instanceof ToolHistoryItem ||
+        item instanceof ToolHistoryGroupItem ||
+        item instanceof FileGroupItem ||
+        item instanceof ToolsSectionItem ||
+        item instanceof TasksSectionItem) {
+      return;
+    }
+
+    const sessionId = item.session.sessionId;
+    const currentAlias = this.sessionAliases.get(sessionId) || '';
+
+    const newAlias = await vscode.window.showInputBox({
+      prompt: 'Enter a custom name for this session (leave empty to clear)',
+      value: currentAlias,
+      placeHolder: 'e.g., "Auth refactor" or "Bug fix #123"'
+    });
+
+    if (newAlias === undefined) {
+      return; // User cancelled
+    }
+
+    if (newAlias === '') {
+      this.sessionAliases.delete(sessionId);
+    } else {
+      this.sessionAliases.set(sessionId, newAlias);
+    }
+
+    // Persist to workspace state
+    this.workspaceState.update('sessionAliases', Object.fromEntries(this.sessionAliases));
+    this.refresh();
+  }
+
+  getSessionAlias(sessionId: string): string | undefined {
+    return this.sessionAliases.get(sessionId);
   }
 }
 
@@ -493,37 +612,41 @@ class TodoListItem extends vscode.TreeItem {
 class SessionItem extends vscode.TreeItem {
   public session: SessionState;
 
-  constructor(session: SessionState, hasChildren: boolean = false, isPinned: boolean = false) {
+  constructor(session: SessionState, hasChildren: boolean = false, isPinned: boolean = false, alias?: string, lastActivityTime?: number) {
     super("", vscode.TreeItemCollapsibleState.None);
     this.session = session;
     // Stable ID for consistent tree rendering across refreshes
     this.id = session.filePath;
-    this.applySessionData(session, hasChildren, isPinned);
+    this.applySessionData(session, hasChildren, isPinned, alias, lastActivityTime);
   }
 
-  updateFromSession(session: SessionState, hasChildren: boolean, isPinned: boolean = false): void {
+  updateFromSession(session: SessionState, hasChildren: boolean, isPinned: boolean = false, alias?: string, lastActivityTime?: number): void {
     this.session = session;
-    this.applySessionData(session, hasChildren, isPinned);
+    this.applySessionData(session, hasChildren, isPinned, alias, lastActivityTime);
   }
 
-  private applySessionData(session: SessionState, hasChildren: boolean, isPinned: boolean = false): void {
+  private applySessionData(session: SessionState, hasChildren: boolean, isPinned: boolean = false, alias?: string, lastActivityTime?: number): void {
     const isAgent = session.isAgent;
 
-    // Label: prefer summary for stable context, fall back to firstUserMessage then lastUserPrompt
+    // Label: use alias if set, otherwise prefer summary, fall back to firstUserMessage then lastUserPrompt
     // For sessions with no user activity yet:
     // - If very recent (< 60s), show "New session"
     // - If older, show summary (Claude loads previous context) or "Waiting for input..."
     // This prevents old unused sessions from showing as "New session" forever
-    const hasUserActivity = session.firstUserMessage || session.lastUserPrompt;
-    const isVeryRecent = (Date.now() - session.created) < 60000; // 60 seconds
     let baseLabel: string;
-    if (hasUserActivity) {
-      baseLabel = session.summary || session.firstUserMessage || session.lastUserPrompt || "New session";
-    } else if (isVeryRecent) {
-      baseLabel = "New session";
+    if (alias) {
+      baseLabel = alias;
     } else {
-      // Older session without user activity - show summary or waiting message
-      baseLabel = session.summary || "Waiting for input...";
+      const hasUserActivity = session.firstUserMessage || session.lastUserPrompt;
+      const isVeryRecent = (Date.now() - session.created) < 60000; // 60 seconds
+      if (hasUserActivity) {
+        baseLabel = session.summary || session.firstUserMessage || session.lastUserPrompt || "New session";
+      } else if (isVeryRecent) {
+        baseLabel = "New session";
+      } else {
+        // Older session without user activity - show summary or waiting message
+        baseLabel = session.summary || "Waiting for input...";
+      }
     }
     this.label = isPinned ? `📌 ${baseLabel}` : baseLabel;
 
@@ -533,16 +656,34 @@ class SessionItem extends vscode.TreeItem {
       ? vscode.TreeItemCollapsibleState.Collapsed
       : vscode.TreeItemCollapsibleState.None;
 
-    // Description: show in-progress task or last user prompt (dynamic activity)
+    // Description: context % + task progress + current activity
     const completedCount = session.todos?.filter(t => t.status === 'completed').length ?? 0;
     const totalCount = session.todos?.length ?? 0;
-    const progressText = totalCount > 0 ? ` (${completedCount}/${totalCount})` : '';
+    const usage = session.tokenUsage;
+    const contextPct = usage.maxContextTokens > 0
+      ? Math.round((usage.contextTokens / usage.maxContextTokens) * 100)
+      : 0;
 
-    this.description = session.inProgressTask
-      ? truncate(session.inProgressTask, DESCRIPTION_TRUNCATE_LENGTH - progressText.length) + progressText
-      : session.lastUserPrompt
-        ? truncate(session.lastUserPrompt, DESCRIPTION_TRUNCATE_LENGTH - progressText.length) + progressText
-        : (totalCount > 0 ? `${completedCount}/${totalCount} tasks` : "");
+    const descParts: string[] = [];
+
+    // Context usage (always show if > 0)
+    if (contextPct > 0) {
+      descParts.push(`${contextPct}%`);
+    }
+
+    // Task progress
+    if (totalCount > 0) {
+      descParts.push(`✓${completedCount}/${totalCount}`);
+    }
+
+    // Current activity (in-progress task or last prompt, truncated)
+    const activity = session.inProgressTask || session.lastUserPrompt;
+    if (activity) {
+      const maxActivityLen = 40; // Shorter since we have other info
+      descParts.push(truncate(activity, maxActivityLen));
+    }
+
+    this.description = descParts.join(' · ');
 
     // Map status to display text
     const statusTextMap: Record<SessionStatus, string> = {
@@ -556,10 +697,6 @@ class SessionItem extends vscode.TreeItem {
     const maxTokenK = Math.round(session.tokenUsage.maxContextTokens / 1000);
 
     const summaryLine = session.summary ? `**Summary:** ${session.summary}\n\n` : "";
-    const usage = session.tokenUsage;
-    const contextPct = usage.maxContextTokens > 0
-      ? Math.round((usage.contextTokens / usage.maxContextTokens) * 100)
-      : 0;
     this.tooltip = new vscode.MarkdownString(
       `**${statusText}** in **${projectName}**\n\n` +
       summaryLine +
@@ -576,8 +713,30 @@ class SessionItem extends vscode.TreeItem {
       [SessionStatus.PAUSED]: { icon: "debug-pause", color: "notificationsWarningIcon.foreground" },
       [SessionStatus.DONE]: { icon: "check", color: "testing.iconPassed" },
     };
-    const config = statusConfig[session.status] || { icon: "circle", color: "foreground" };
-    this.iconPath = new vscode.ThemeIcon(config.icon, new vscode.ThemeColor(config.color));
+    let config = statusConfig[session.status] || { icon: "circle", color: "foreground" };
+
+    // Check if session is stalled (WORKING but no activity for > threshold)
+    const stalledThresholdMs = vscode.workspace.getConfiguration('claudeWatch').get<number>('stalledThresholdMinutes', 5) * 60 * 1000;
+    const isStalled = session.status === SessionStatus.WORKING &&
+                      lastActivityTime &&
+                      (Date.now() - lastActivityTime) > stalledThresholdMs;
+
+    if (isStalled) {
+      // Override icon for stalled sessions
+      config = { icon: "warning", color: "notificationsWarningIcon.foreground" };
+      // Add stalled time to description
+      const stalledMinutes = Math.floor((Date.now() - lastActivityTime!) / 60000);
+      this.description = `⚠️ Stalled ${stalledMinutes}m · ${this.description}`;
+    }
+
+    // Override color based on context usage (warning at 75%, critical at 90%)
+    let iconColor = config.color;
+    if (contextPct >= 90) {
+      iconColor = "testing.iconFailed"; // Red - critical
+    } else if (contextPct >= 75 && !isStalled) {
+      iconColor = "notificationsWarningIcon.foreground"; // Yellow - warning (skip if already stalled)
+    }
+    this.iconPath = new vscode.ThemeIcon(config.icon, new vscode.ThemeColor(iconColor));
 
     // Include pinned state in contextValue for potential menu customization
     const pinnedSuffix = isPinned ? "Pinned" : "";
@@ -602,12 +761,33 @@ interface StatusCounts {
 }
 
 /**
+ * History stats for old sessions category
+ */
+interface HistoryStats {
+  sessionCount: number;
+  totalTokens: number;
+}
+
+/**
+ * Format token count for display (e.g., 125K, 1.2M)
+ */
+function formatTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    return `${(tokens / 1_000_000).toFixed(1)}M`;
+  }
+  if (tokens >= 1_000) {
+    return `${Math.round(tokens / 1_000)}K`;
+  }
+  return tokens.toString();
+}
+
+/**
  * Category item for grouping active and old sessions
  */
 class CategoryItem extends vscode.TreeItem {
   public readonly category: 'active' | 'old';
 
-  constructor(category: 'active' | 'old', label: string, count: number, statusCounts?: StatusCounts) {
+  constructor(category: 'active' | 'old', label: string, count: number, statusCounts?: StatusCounts, historyStats?: HistoryStats, activeTokens?: number) {
     // Active is expanded by default, Old is collapsed
     const collapsibleState = category === 'active'
       ? vscode.TreeItemCollapsibleState.Expanded
@@ -616,15 +796,15 @@ class CategoryItem extends vscode.TreeItem {
     this.category = category;
     this.id = `category:${category}`;
     this.contextValue = 'category';
-    this.updateCount(count, statusCounts);
+    this.updateCount(count, statusCounts, historyStats, activeTokens);
     this.iconPath = category === 'active'
       ? new vscode.ThemeIcon('play-circle', new vscode.ThemeColor('charts.blue'))
       : new vscode.ThemeIcon('history', new vscode.ThemeColor('descriptionForeground'));
   }
 
-  updateCount(count: number, statusCounts?: StatusCounts): void {
+  updateCount(count: number, statusCounts?: StatusCounts, historyStats?: HistoryStats, activeTokens?: number): void {
     if (this.category === 'active' && statusCounts && count > 0) {
-      // Show status breakdown for active sessions
+      // Show status breakdown and token count for active sessions
       const parts: string[] = [];
       if (statusCounts.working > 0) {
         parts.push(`${statusCounts.working} working`);
@@ -635,7 +815,15 @@ class CategoryItem extends vscode.TreeItem {
       if (statusCounts.done > 0) {
         parts.push(`${statusCounts.done} done`);
       }
+      // Add token count if available
+      if (activeTokens && activeTokens > 0) {
+        parts.push(`${formatTokenCount(activeTokens)} ctx`);
+      }
       this.description = parts.length > 0 ? parts.join(' · ') : `${count} session${count !== 1 ? 's' : ''}`;
+    } else if (this.category === 'old' && historyStats && historyStats.totalTokens > 0) {
+      // Show session count and total tokens for history
+      const sessionText = `${count} session${count !== 1 ? 's' : ''}`;
+      this.description = `${sessionText} · ${formatTokenCount(historyStats.totalTokens)} tokens`;
     } else {
       this.description = `${count} session${count !== 1 ? 's' : ''}`;
     }
@@ -666,23 +854,40 @@ class OldSessionItem extends vscode.TreeItem {
     const hasUserActivity = session.firstUserMessage || session.lastUserPrompt;
     this.label = hasUserActivity
       ? (session.summary || session.firstUserMessage || session.lastUserPrompt)
-      : "Old session";
+      : "Past session";
 
-    // Description: relative time ago
+    // Description: token usage, task completion, and time ago
+    const parts: string[] = [];
+
+    // Token usage
+    const tokenK = Math.round(session.tokenUsage.contextTokens / 1000);
+    if (tokenK > 0) {
+      parts.push(`${tokenK}K`);
+    }
+
+    // Task completion (if any todos)
+    if (session.todos && session.todos.length > 0) {
+      const completed = session.todos.filter(t => t.status === 'completed').length;
+      parts.push(`✓${completed}/${session.todos.length}`);
+    }
+
+    // Time ago
     const ageMs = Date.now() - session.lastModified;
     const ageMinutes = Math.floor(ageMs / (1000 * 60));
     const ageHours = Math.floor(ageMs / (1000 * 60 * 60));
     const ageDays = Math.floor(ageHours / 24);
 
     if (ageDays > 0) {
-      this.description = `${ageDays}d ago`;
+      parts.push(`${ageDays}d ago`);
     } else if (ageHours > 0) {
-      this.description = `${ageHours}h ago`;
+      parts.push(`${ageHours}h ago`);
     } else if (ageMinutes > 0) {
-      this.description = `${ageMinutes}m ago`;
+      parts.push(`${ageMinutes}m ago`);
     } else {
-      this.description = "just now";
+      parts.push("just now");
     }
+
+    this.description = parts.join(' · ');
 
     // Icon: history icon
     this.iconPath = new vscode.ThemeIcon("history");
@@ -694,7 +899,7 @@ class OldSessionItem extends vscode.TreeItem {
     const projectName = path.basename(session.cwd) || session.cwd;
     const summaryLine = session.summary ? `**Summary:** ${session.summary}\n\n` : "";
     this.tooltip = new vscode.MarkdownString(
-      `**Old Session** in **${projectName}**\n\n` +
+      `**Past Session** in **${projectName}**\n\n` +
       summaryLine +
       `**First message:** ${session.firstUserMessage || "(none)"}\n\n` +
       `**Last prompt:** ${session.lastUserPrompt || "(none)"}\n\n` +
@@ -751,33 +956,60 @@ class ToolHistoryItem extends vscode.TreeItem {
   public readonly sessionFilePath: string;
   public readonly tool: RecentTool;
 
-  constructor(tool: RecentTool, sessionFilePath: string, index: number) {
+  constructor(tool: RecentTool, sessionFilePath: string, index: number, prefix: string = "direct") {
     const label = formatToolLabel(tool.name, tool.input);
     super(label, vscode.TreeItemCollapsibleState.None);
 
     this.tool = tool;
     this.sessionFilePath = sessionFilePath;
-    this.id = `${sessionFilePath}:tool:${index}`;
+    this.id = `${sessionFilePath}:tool:${prefix}:${index}`;
     this.contextValue = "toolHistory";
 
-    // Use tool-specific icon (faded color for completed)
+    // Use tool-specific icon - recent tools get color, older ones are faded
     const iconConfig = getToolIcon(tool.name);
+    const ageMs = Date.now() - tool.timestamp;
+    const isRecent = ageMs < 30000; // Within last 30 seconds
     this.iconPath = new vscode.ThemeIcon(
       iconConfig.icon,
-      new vscode.ThemeColor("descriptionForeground")
+      new vscode.ThemeColor(isRecent ? (iconConfig.color || "charts.blue") : "descriptionForeground")
     );
 
-    // Show duration
-    this.description = formatToolDescription(tool.name, tool.input, tool.result, tool.duration);
+    // Show duration and relative time
+    const baseDesc = formatToolDescription(tool.name, tool.input, tool.result, tool.duration);
+    const relativeTime = formatRelativeTime(tool.timestamp);
+    this.description = `${baseDesc} · ${relativeTime}`;
 
     // Tooltip with full details
     const resultStr = tool.result ? `\n\n**Result:**\n\`\`\`json\n${JSON.stringify(tool.result, null, 2).slice(0, 500)}...\n\`\`\`` : "";
     this.tooltip = new vscode.MarkdownString(
-      `**${tool.name}** completed in ${this.description}\n\n` +
+      `**${tool.name}** completed ${relativeTime} (took ${formatDuration(tool.duration)})\n\n` +
       `**Input:**\n\`\`\`json\n${JSON.stringify(tool.input, null, 2)}\n\`\`\`` +
       resultStr
     );
   }
+}
+
+/**
+ * Format a timestamp as relative time (e.g., "2s ago", "5m ago")
+ */
+function formatRelativeTime(timestamp: number): string {
+  const ageMs = Date.now() - timestamp;
+  const seconds = Math.floor(ageMs / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+
+  if (seconds < 5) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  if (minutes < 60) return `${minutes}m ago`;
+  return `${hours}h ago`;
+}
+
+/**
+ * Format duration in ms to human readable
+ */
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
 }
 
 /**
@@ -840,14 +1072,14 @@ function getToolFilePath(tool: RecentTool): string | null {
 }
 
 /**
- * Collapsible section containing all tool operations
+ * Collapsible section containing overflow tool operations (older than first 5)
  */
 class ToolsSectionItem extends vscode.TreeItem {
   public readonly tools: RecentTool[];
   public readonly sessionFilePath: string;
 
   constructor(tools: RecentTool[], sessionFilePath: string) {
-    super("Tools", vscode.TreeItemCollapsibleState.Collapsed);
+    super("More tools...", vscode.TreeItemCollapsibleState.Collapsed);
 
     this.tools = tools;
     this.sessionFilePath = sessionFilePath;
@@ -855,8 +1087,8 @@ class ToolsSectionItem extends vscode.TreeItem {
     this.contextValue = "toolsSection";
 
     this.iconPath = new vscode.ThemeIcon("tools", new vscode.ThemeColor("descriptionForeground"));
-    this.description = `${tools.length} recent`;
-    this.tooltip = `${tools.length} tool operations in this session (click to expand)`;
+    this.description = `${tools.length} more`;
+    this.tooltip = `${tools.length} older tool operations (click to expand)`;
   }
 }
 
@@ -875,8 +1107,23 @@ class TasksSectionItem extends vscode.TreeItem {
     this.id = `${sessionFilePath}:tasks-section`;
     this.contextValue = "tasksSection";
 
+    // Find current task: in_progress first, then last completed
+    const inProgressTask = todos.find(t => t.status === 'in_progress');
+    const completedTasks = todos.filter(t => t.status === 'completed');
+    const lastCompletedTask = completedTasks.length > 0 ? completedTasks[completedTasks.length - 1] : null;
+    const currentTask = inProgressTask || lastCompletedTask;
+
+    // Show progress count with current task
+    const progressText = `${completedCount}/${todos.length}`;
+    if (currentTask) {
+      const statusPrefix = inProgressTask ? '⟳' : '✓';
+      const taskText = truncate(currentTask.content, DESCRIPTION_TRUNCATE_LENGTH - progressText.length - 4);
+      this.description = `${progressText} · ${statusPrefix} ${taskText}`;
+    } else {
+      this.description = `${progressText} done`;
+    }
+
     this.iconPath = new vscode.ThemeIcon("checklist", new vscode.ThemeColor("descriptionForeground"));
-    this.description = `${completedCount}/${todos.length} done`;
     this.tooltip = `${todos.length} tasks (${completedCount} completed) - click to expand`;
   }
 }

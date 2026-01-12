@@ -40,7 +40,7 @@ if [ "$EVENT" = "PreToolUse" ] || [ "$EVENT" = "PostToolUse" ]; then
   TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
   TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input // {}')
   TOOL_RESULT=$(echo "$INPUT" | jq -c '.tool_result // null')
-  TIMESTAMP=$(date +%s000)
+  TIMESTAMP=$(python3 -c "import time; print(int(time.time() * 1000))")
 
   MSG=$(jq -c -n \\
     --arg event "$EVENT" \\

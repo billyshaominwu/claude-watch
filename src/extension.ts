@@ -181,6 +181,42 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   );
 
+  const copyResumeCommand = vscode.commands.registerCommand(
+    "claude-watch.copyResumeCommand",
+    async (item) => {
+      if (!item || !item.session) {
+        return;
+      }
+      const sessionId = item.session.sessionId;
+      const command = `claude --resume ${sessionId}`;
+      await vscode.env.clipboard.writeText(command);
+      vscode.window.showInformationMessage(`Copied: ${command}`);
+    }
+  );
+
+  const viewTranscriptCommand = vscode.commands.registerCommand(
+    "claude-watch.viewTranscript",
+    async (item) => {
+      if (!item || !item.session) {
+        return;
+      }
+      const filePath = item.session.filePath;
+      if (filePath) {
+        const uri = vscode.Uri.file(filePath);
+        await vscode.window.showTextDocument(uri);
+      }
+    }
+  );
+
+  const renameSessionCommand = vscode.commands.registerCommand(
+    "claude-watch.renameSession",
+    async (item) => {
+      if (sessionTreeProvider && item) {
+        await sessionTreeProvider.renameSession(item);
+      }
+    }
+  );
+
   context.subscriptions.push(
     treeView,
     newSessionCommand,
@@ -188,7 +224,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     openTerminalCommand,
     pinSessionCommand,
     resumeSessionCommand,
-    openSettingsCommand
+    openSettingsCommand,
+    copyResumeCommand,
+    viewTranscriptCommand,
+    renameSessionCommand
   );
 
   // Listen for terminal close events to clean up sessions
