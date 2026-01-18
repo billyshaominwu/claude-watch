@@ -4,6 +4,12 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 
+function debugLog(message: string): void {
+  if (vscode.workspace.getConfiguration('claudeWatch').get<boolean>('debug', false)) {
+    console.log(`Claude Watch: ${message}`);
+  }
+}
+
 /**
  * Event received from Claude Code session hooks
  */
@@ -86,7 +92,7 @@ export class HookServer {
       this.server.listen(0, "127.0.0.1", () => {
         const address = this.server!.address() as net.AddressInfo;
         this.port = address.port;
-        console.log(`Claude Watch: Hook server listening on port ${this.port}`);
+        debugLog(`Hook server listening on port ${this.port}`);
 
         // Write port to file for hooks to read
         this.writePortFile();
@@ -129,9 +135,7 @@ export class HookServer {
       }
 
       fs.writeFileSync(portFile, existingPorts.join("\n"));
-      console.log(
-        `Claude Watch: Registered port ${this.port} (${existingPorts.length} total ports)`
-      );
+      debugLog(`Registered port ${this.port} (${existingPorts.length} total ports)`);
     } catch (err) {
       console.error("Claude Watch: Failed to write port file:", err);
     }
@@ -184,7 +188,7 @@ export class HookServer {
 
         if (eventType === "SessionStart" || eventType === "SessionEnd") {
           const event = parsed as HookEvent;
-          console.log(`Claude Watch: Received hook event: ${event.event} for session ${event.sessionId}`);
+          debugLog(`Received hook event: ${event.event} for session ${event.sessionId}`);
 
           if (event.event === "SessionStart") {
             this._onSessionStart.fire(event);
@@ -193,7 +197,7 @@ export class HookServer {
           }
         } else if (eventType === "PreToolUse" || eventType === "PostToolUse") {
           const event = parsed as ToolHookEvent;
-          console.log(`Claude Watch: Received tool event: ${event.event} - ${event.toolName} for session ${event.sessionId}`);
+          debugLog(`Received tool event: ${event.event} - ${event.toolName} for session ${event.sessionId}`);
 
           if (event.event === "PreToolUse") {
             this._onPreToolUse.fire(event);

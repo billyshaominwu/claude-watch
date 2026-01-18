@@ -10,10 +10,18 @@ let sessionRegistry: SessionRegistry | null = null;
 let sessionTreeProvider: SessionTreeProvider | null = null;
 let outputChannel: vscode.OutputChannel | null = null;
 
+function isDebugEnabled(): boolean {
+  return vscode.workspace.getConfiguration('claudeWatch').get<boolean>('debug', false);
+}
+
 export function log(message: string): void {
   const timestamp = new Date().toISOString().slice(11, 23);
   const line = `[${timestamp}] ${message}`;
-  console.log(`Claude Watch: ${message}`);
+  // Only log to console when debug is enabled
+  if (isDebugEnabled()) {
+    console.log(`Claude Watch: ${message}`);
+  }
+  // Always log to output channel (user can view when needed)
   outputChannel?.appendLine(line);
 }
 
@@ -217,6 +225,66 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     }
   );
 
+  const expandAllCommand = vscode.commands.registerCommand(
+    "claude-watch.expandAll",
+    async () => {
+      if (!sessionTreeProvider) return;
+
+      // Ensure tree view is visible
+      await vscode.commands.executeCommand("claudeSessions.focus");
+
+      // Expand category items first - this populates parentMap for children
+      const categoryItems = await sessionTreeProvider.getCategoryItems();
+      for (const item of categoryItems) {
+        try {
+          // Reveal with expand to trigger getChildren and populate parentMap
+          await treeView.reveal(item, { expand: 2, focus: false, select: false });
+        } catch {
+          // Item may not be in tree yet, ignore
+        }
+      }
+      // Small delay to let VS Code process the reveals
+      await new Promise(resolve => setTimeout(resolve, 100));
+      // Then expand session items (now parentMap should be populated)
+      for (const item of sessionTreeProvider.getAllSessionItems()) {
+        try {
+          await treeView.reveal(item, { expand: 2, focus: false, select: false });
+        } catch {
+          // Item may not be in tree yet, ignore
+        }
+      }
+    }
+  );
+
+  const collapseAllCommand = vscode.commands.registerCommand(
+    "claude-watch.collapseAll",
+    () => {
+      vscode.commands.executeCommand(
+        "workbench.actions.treeView.claudeSessions.collapseAll"
+      );
+    }
+  );
+
+  const closeSessionCommand = vscode.commands.registerCommand(
+    "claude-watch.closeSession",
+    (item) => {
+      if (!item || !item.session) {
+        return;
+      }
+
+      const sessionId = item.session.sessionId;
+      const terminal = sessionRegistry?.getLinkedTerminal(sessionId);
+
+      if (terminal) {
+        // Closing terminal triggers onDidCloseTerminal which cleans up the session
+        terminal.dispose();
+      } else {
+        // No linked terminal - manually end session
+        sessionRegistry?.endSession(sessionId);
+      }
+    }
+  );
+
   context.subscriptions.push(
     treeView,
     newSessionCommand,
@@ -227,7 +295,10 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
     openSettingsCommand,
     copyResumeCommand,
     viewTranscriptCommand,
-    renameSessionCommand
+    renameSessionCommand,
+    expandAllCommand,
+    collapseAllCommand,
+    closeSessionCommand
   );
 
   // Listen for terminal close events to clean up sessions
@@ -249,7 +320,7 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         }
       }, 500);
     } catch (err) {
-      console.error("Claude Watch: Error in terminal close handler:", err);
+      log(`Error in terminal close handler: ${err}`);
     }
   });
 

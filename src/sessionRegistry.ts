@@ -10,15 +10,15 @@ import { HookServer, HookEvent, ToolHookEvent } from "./hookServer";
 import { parseTranscript, SessionState, SessionStatus } from "./transcriptParser";
 import { cwdEquals } from "./utils";
 import { log } from "./extension";
+import { TerminalLinker } from "./terminalLinker";
 
 // Constants
 const DEBOUNCE_MS = 150;
-const SCAN_INTERVAL_MS = 2000;
+const FILE_CHANGE_DEBOUNCE_MS = 100; // Debounce rapid file system events
+const SCAN_INTERVAL_MS = 5000; // Scan every 5 seconds (performance: was 2s)
 const MAX_INACTIVE_SESSIONS = 500; // Limit stored inactive sessions to prevent memory leak
 const MAX_RECENT_TOOLS = 15; // Limit recent tools per session to prevent memory leak
-const STALE_TOOL_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes - clear currentTool if no PostToolUse
-const MAX_PENDING_TERMINALS = 50; // Limit pending terminals to prevent memory leak
-const ACTIVITY_THRESHOLD_MS = 10000; // 10 seconds - consider session active if modified recently
+const STALE_TOOL_TIMEOUT_MS = 30 * 1000; // 30 seconds - clear currentTool if no PostToolUse
 
 /**
  * Current tool being executed
@@ -67,12 +67,12 @@ export interface SessionRecord {
  *
  * Replaces the previous architecture of:
  * - sessionManager.ts (JSONL watching + process matching)
- * - sessionProcessMap.ts (persistent TTY→session mapping)
+ * - sessionProcessMap.ts (persistent TTY->session mapping)
  * - terminalTracker.ts (ps/lsof polling)
  * - terminalMatcher.ts (heuristic matching)
  *
  * Key insight: Hooks are executed BY the Claude process, so they provide
- * ground-truth session→process identity. No more heuristics needed.
+ * ground-truth session->process identity. No more heuristics needed.
  */
 export class SessionRegistry {
   // Active sessions (have received SessionStart, not yet SessionEnd)
@@ -82,9 +82,9 @@ export class SessionRegistry {
   private allSessions: Map<string, SessionState> = new Map();
 
   // Fast lookup indexes
-  private ppidIndex: Map<number, string> = new Map(); // ppid → sessionId
-  private pidIndex: Map<number, string> = new Map(); // pid → sessionId (Claude process PID)
-  private pathIndex: Map<string, string> = new Map(); // transcriptPath → sessionId
+  private ppidIndex: Map<number, string> = new Map(); // ppid -> sessionId
+  private pidIndex: Map<number, string> = new Map(); // pid -> sessionId (Claude process PID)
+  private pathIndex: Map<string, string> = new Map(); // transcriptPath -> sessionId
 
   // File watching
   private watcher: vscode.FileSystemWatcher | null = null;
@@ -101,14 +101,13 @@ export class SessionRegistry {
 
   // Debouncing
   private debounceTimer: NodeJS.Timeout | null = null;
+  private fileChangeTimers: Map<string, NodeJS.Timeout> = new Map(); // Per-file debounce for file watcher
 
   // Orphaned agents waiting for parent
   private orphanedAgents: Map<string, string> = new Map(); // filePath -> parentSessionId
 
-  // Linked terminals - terminal references for sessions we can navigate to
-  private linkedTerminals: Map<string, vscode.Terminal> = new Map(); // sessionId → Terminal
-  private terminalToSession: WeakMap<vscode.Terminal, string> = new WeakMap(); // Terminal → sessionId (WeakMap for GC)
-  private pendingTerminals: Map<string, vscode.Terminal> = new Map(); // terminalId → Terminal (waiting for hook)
+  // Terminal linking (delegated to TerminalLinker)
+  private terminalLinker: TerminalLinker;
 
   // Persistent storage
   private context: vscode.ExtensionContext | null = null;
@@ -121,6 +120,10 @@ export class SessionRegistry {
   ) {
     this.workspacePath = workspacePath;
     this.context = context || null;
+
+    // Initialize terminal linker
+    this.terminalLinker = new TerminalLinker();
+    this.terminalLinker.onUpdate(() => this.notifyUpdate());
 
     // Listen for hook events
     hookServer.onSessionStart((event) => this.handleSessionStart(event));
@@ -141,26 +144,27 @@ export class SessionRegistry {
     try {
       await this.restorePersistedSessions();
     } catch (err) {
-      console.error("Claude Watch: Error restoring sessions:", err);
+      log(`Error restoring sessions: ${err}`);
     }
 
     // Initial scan for transcript state (can run in background)
     this.scanAllProjects().catch((err) => {
-      console.error("Claude Watch: Error in initial scan:", err);
+      log(`Error in initial scan: ${err}`);
     });
 
     // Watch for JSONL file changes
     const pattern = new vscode.RelativePattern(projectsPath, "**/*.jsonl");
     this.watcher = vscode.workspace.createFileSystemWatcher(pattern);
 
-    this.watcher.onDidChange((uri) => this.handleFileChange(uri));
-    this.watcher.onDidCreate((uri) => this.handleFileChange(uri));
+    // Debounce file change events - rapid file system events are coalesced per-file
+    this.watcher.onDidChange((uri) => this.debouncedFileChange(uri));
+    this.watcher.onDidCreate((uri) => this.debouncedFileChange(uri));
     this.watcher.onDidDelete((uri) => this.handleFileDelete(uri));
 
     // Periodic scan for missed updates
     this.scanInterval = setInterval(() => {
       this.scanAllProjects().catch((err) => {
-        console.error("Claude Watch: Error in periodic scan:", err);
+        log(`Error in periodic scan: ${err}`);
       });
     }, SCAN_INTERVAL_MS);
   }
@@ -179,6 +183,7 @@ export class SessionRegistry {
       ppid: number;
       tty: string;
       pidStartTime: string | null;
+      recentTools: RecentTool[];
     }> = [];
 
     for (const [, record] of this.activeSessions) {
@@ -190,6 +195,7 @@ export class SessionRegistry {
         ppid: record.ppid,
         tty: record.tty,
         pidStartTime: record.pidStartTime,
+        recentTools: record.recentTools,
       });
     }
 
@@ -215,6 +221,7 @@ export class SessionRegistry {
       ppid: number;
       tty: string;
       pidStartTime?: string | null; // Optional for backwards compat
+      recentTools?: RecentTool[]; // Optional for backwards compat
     }>>(SessionRegistry.STORAGE_KEY, []);
 
     log(`Restoring ${sessions.length} persisted sessions`);
@@ -235,7 +242,7 @@ export class SessionRegistry {
       }
 
       // Check if session can be linked to a VS Code terminal before restoring
-      const canLink = await this.canLinkToVSCodeTerminal(session.pid, session.ppid);
+      const canLink = await this.terminalLinker.canLinkToVSCodeTerminal(session.pid, session.ppid);
       if (!canLink) {
         log(`Session ${session.sessionId} filtered out - not started in VS Code terminal`);
         continue;
@@ -252,7 +259,7 @@ export class SessionRegistry {
         tty: session.tty,
         pidStartTime: session.pidStartTime || null,
         state: null,
-        recentTools: [],
+        recentTools: session.recentTools || [], // Restore persisted tool history
         lastActivityTime: Date.now(), // Will be updated when transcript is parsed
       };
 
@@ -262,10 +269,19 @@ export class SessionRegistry {
       this.pathIndex.set(session.transcriptPath, session.sessionId);
 
       // Parse transcript for state
-      this.parseAndUpdateSession(session.transcriptPath);
+      await this.parseAndUpdateSession(session.transcriptPath);
 
       // Try to link terminal for restored session
-      await this.tryLazyLink(session.sessionId, session.ppid);
+      await this.terminalLinker.tryLazyLink(
+        session.sessionId,
+        session.ppid,
+        session.pid,
+        (newPpid) => {
+          this.ppidIndex.delete(record.ppid);
+          record.ppid = newPpid;
+          this.ppidIndex.set(newPpid, session.sessionId);
+        }
+      );
 
       restoredCount++;
 
@@ -334,22 +350,25 @@ export class SessionRegistry {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;
     }
+    // Clear file change debounce timers
+    for (const timer of this.fileChangeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.fileChangeTimers.clear();
     // Clear stale tool timers to prevent leaks
     for (const record of this.activeSessions.values()) {
       if (record.currentTool?.staleTimer) {
         clearTimeout(record.currentTool.staleTimer);
       }
     }
-    // Clear linked terminal references
-    this.linkedTerminals.clear();
-    this.pendingTerminals.clear();
-    // WeakMap auto-cleans
+    // Clean up terminal linker
+    this.terminalLinker.dispose();
   }
 
   /**
    * Handle SessionStart hook event
    */
-  private handleSessionStart(event: HookEvent): void {
+  private async handleSessionStart(event: HookEvent): Promise<void> {
     log(`SessionStart: ${event.sessionId} (pid=${event.pid}, ppid=${event.ppid})`);
 
     // Clean up any existing session with this PID or PPID (in case restored session has wrong ID)
@@ -401,19 +420,19 @@ export class SessionRegistry {
     this.persistSessions();
 
     // Try to link pending terminal (from extension-created terminals)
-    this.linkPendingTerminal(event.sessionId, event.ppid);
+    await this.terminalLinker.linkPendingTerminal(event.sessionId, event.ppid);
 
     // Clear mtime cache to force re-parse (handles resumed sessions where file may already be cached)
     this.fileLastModified.delete(event.transcriptPath);
 
     // Parse the transcript file for state
-    this.parseAndUpdateSession(event.transcriptPath);
+    await this.parseAndUpdateSession(event.transcriptPath);
   }
 
   /**
    * Handle SessionEnd hook event
    */
-  private handleSessionEnd(event: HookEvent): void {
+  private async handleSessionEnd(event: HookEvent): Promise<void> {
     log(`SessionEnd: ${event.sessionId}`);
 
     const record = this.activeSessions.get(event.sessionId);
@@ -431,13 +450,51 @@ export class SessionRegistry {
       let state = record.state;
       if (!state && record.transcriptPath) {
         this.fileLastModified.delete(record.transcriptPath);
-        state = parseTranscript(record.transcriptPath);
+        state = await parseTranscript(record.transcriptPath);
       }
 
       // Move to inactive (for "Old Sessions" view)
       if (state) {
         this.allSessions.set(event.sessionId, state);
       }
+    }
+
+    this.notifyUpdate();
+  }
+
+  /**
+   * Manually end a session (for close button when no linked terminal)
+   */
+  public async endSession(sessionId: string): Promise<void> {
+    log(`Manually ending session: ${sessionId}`);
+
+    const record = this.activeSessions.get(sessionId);
+    if (!record) {
+      return;
+    }
+
+    // Remove from indexes
+    this.pidIndex.delete(record.pid);
+    this.ppidIndex.delete(record.ppid);
+    this.pathIndex.delete(record.transcriptPath);
+    this.activeSessions.delete(sessionId);
+
+    // Remove from linked terminals if present
+    this.terminalLinker.removeLinkedTerminal(sessionId);
+
+    // Persist after removal
+    this.persistSessions();
+
+    // Ensure we have state for "Old Sessions" list
+    let state = record.state;
+    if (!state && record.transcriptPath) {
+      this.fileLastModified.delete(record.transcriptPath);
+      state = await parseTranscript(record.transcriptPath);
+    }
+
+    // Move to inactive (for "Old Sessions" view)
+    if (state) {
+      this.allSessions.set(sessionId, state);
     }
 
     this.notifyUpdate();
@@ -457,8 +514,17 @@ export class SessionRegistry {
       log(`PreToolUse: ${event.toolName} for session ${event.sessionId}`);
 
       // Try lazy linking if session is not yet linked to a terminal
-      if (!this.linkedTerminals.has(event.sessionId)) {
-        this.tryLazyLink(event.sessionId, event.ppid);
+      if (!this.terminalLinker.hasLinkedTerminal(event.sessionId)) {
+        this.terminalLinker.tryLazyLink(
+          event.sessionId,
+          event.ppid,
+          record.pid,
+          (newPpid) => {
+            this.ppidIndex.delete(record.ppid);
+            record.ppid = newPpid;
+            this.ppidIndex.set(newPpid, event.sessionId);
+          }
+        );
       }
 
       // Clear any existing stale timer
@@ -486,7 +552,7 @@ export class SessionRegistry {
 
       this.notifyUpdate();
     } catch (err) {
-      console.error("Claude Watch: Error handling PreToolUse:", err);
+      log(`Error handling PreToolUse: ${err}`);
     }
   }
 
@@ -535,7 +601,7 @@ export class SessionRegistry {
 
       this.notifyUpdate();
     } catch (err) {
-      console.error("Claude Watch: Error handling PostToolUse:", err);
+      log(`Error handling PostToolUse: ${err}`);
     }
   }
 
@@ -546,182 +612,28 @@ export class SessionRegistry {
     return this.activeSessions.get(sessionId);
   }
 
-  // --- Terminal Linking Methods ---
+  // --- Terminal Linking Methods (delegated to TerminalLinker) ---
 
   /**
    * Register a pending terminal before hook fires.
    * Called when extension creates a terminal for "New Session" or "Resume Session".
    */
   public registerPendingTerminal(terminal: vscode.Terminal): void {
-    // Generate a unique ID for this pending terminal
-    const terminalId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-
-    // Size limit per audit guide
-    if (this.pendingTerminals.size >= MAX_PENDING_TERMINALS) {
-      const firstKey = this.pendingTerminals.keys().next().value;
-      if (firstKey) {
-        this.pendingTerminals.delete(firstKey);
-      }
-    }
-    this.pendingTerminals.set(terminalId, terminal);
-    log(`Registered pending terminal ${terminalId}`);
+    this.terminalLinker.registerPendingTerminal(terminal);
   }
 
   /**
    * Get linked terminal for session (O(1) lookup, no process spawning)
    */
   public getLinkedTerminal(sessionId: string): vscode.Terminal | undefined {
-    return this.linkedTerminals.get(sessionId);
+    return this.terminalLinker.getLinkedTerminal(sessionId);
   }
 
   /**
    * Clean up when terminal closes (called from extension.ts)
    */
   public handleTerminalClose(terminal: vscode.Terminal): void {
-    const sessionId = this.terminalToSession.get(terminal);
-    if (sessionId) {
-      this.linkedTerminals.delete(sessionId);
-      log(`Removed linked terminal for session ${sessionId}`);
-      // WeakMap auto-cleans terminalToSession
-    }
-    // Also clean pending terminals
-    for (const [id, t] of this.pendingTerminals) {
-      if (t === terminal) {
-        this.pendingTerminals.delete(id);
-        log(`Removed pending terminal ${id}`);
-        break;
-      }
-    }
-  }
-
-  /**
-   * Link a pending terminal to a session when SessionStart hook fires.
-   * Uses async processId check (not sync spawn).
-   */
-  private async linkPendingTerminal(sessionId: string, ppid: number): Promise<void> {
-    // Check pending terminals for matching PPID
-    for (const [terminalId, terminal] of this.pendingTerminals) {
-      try {
-        const terminalPid = await terminal.processId;
-        if (terminalPid === ppid) {
-          this.linkedTerminals.set(sessionId, terminal);
-          this.terminalToSession.set(terminal, sessionId);
-          this.pendingTerminals.delete(terminalId);
-          log(`Linked terminal for session ${sessionId}`);
-          return;
-        }
-      } catch {
-        // Terminal may have closed, ignore
-      }
-    }
-  }
-
-  /**
-   * Try to lazy-link a terminal for a session that missed initial linking.
-   * Called when tool hooks fire for sessions started before extension activation,
-   * or when restoring sessions after VS Code reload.
-   */
-  private async tryLazyLink(sessionId: string, ppid: number): Promise<void> {
-    const record = this.activeSessions.get(sessionId);
-
-    // Collect terminal PIDs for logging
-    const terminalPids: number[] = [];
-    for (const terminal of vscode.window.terminals) {
-      try {
-        const pid = await terminal.processId;
-        if (pid) terminalPids.push(pid);
-      } catch {
-        // ignore
-      }
-    }
-
-    // First, try direct PPID lookup
-    for (const terminal of vscode.window.terminals) {
-      try {
-        const terminalPid = await terminal.processId;
-        if (terminalPid === ppid) {
-          this.linkedTerminals.set(sessionId, terminal);
-          this.terminalToSession.set(terminal, sessionId);
-          log(`Lazy-linked terminal for session ${sessionId} (direct PPID match)`);
-          this.notifyUpdate();
-          return;
-        }
-      } catch {
-        // Terminal may have closed, ignore
-      }
-    }
-
-    // Fallback: search for terminal that has Claude (record.pid) as a descendant
-    // This handles cases where there's an intermediate shell between terminal and Claude
-    if (record?.pid) {
-      try {
-        const ancestorPids = await this.getProcessAncestors(record.pid);
-
-        for (const terminal of vscode.window.terminals) {
-          try {
-            const terminalPid = await terminal.processId;
-            if (terminalPid && ancestorPids.has(terminalPid)) {
-              // Update the record with the correct PPID for future lookups
-              this.ppidIndex.delete(record.ppid);
-              record.ppid = terminalPid;
-              this.ppidIndex.set(terminalPid, sessionId);
-
-              this.linkedTerminals.set(sessionId, terminal);
-              this.terminalToSession.set(terminal, sessionId);
-              log(`Lazy-linked terminal for session ${sessionId} (ancestor search)`);
-              this.notifyUpdate();
-              return;
-            }
-          } catch {
-            // Terminal may have closed, ignore
-          }
-        }
-
-        // Log failure with details
-        log(`tryLazyLink FAILED for session ${sessionId}: ppid=${ppid}, pid=${record.pid}, ancestors=[${[...ancestorPids].join(',')}], terminalPids=[${terminalPids.join(',')}]`);
-      } catch {
-        // Ignore errors in fallback
-      }
-    } else {
-      log(`tryLazyLink FAILED for session ${sessionId}: ppid=${ppid}, no pid in record, terminalPids=[${terminalPids.join(',')}]`);
-    }
-  }
-
-  /**
-   * Check if a session can be linked to a VS Code terminal.
-   * Returns true if the session's PPID matches a terminal or if any ancestor is a terminal.
-   */
-  private async canLinkToVSCodeTerminal(pid: number, ppid: number): Promise<boolean> {
-    // Check direct PPID match first
-    for (const terminal of vscode.window.terminals) {
-      try {
-        const terminalPid = await terminal.processId;
-        if (terminalPid === ppid) {
-          return true;
-        }
-      } catch {
-        // Terminal may have closed, ignore
-      }
-    }
-
-    // Check if any ancestor is a VS Code terminal
-    try {
-      const ancestorPids = await this.getProcessAncestors(pid);
-      for (const terminal of vscode.window.terminals) {
-        try {
-          const terminalPid = await terminal.processId;
-          if (terminalPid && ancestorPids.has(terminalPid)) {
-            return true;
-          }
-        } catch {
-          // Terminal may have closed, ignore
-        }
-      }
-    } catch {
-      // Ignore errors
-    }
-
-    return false;
+    this.terminalLinker.handleTerminalClose(terminal);
   }
 
   /**
@@ -730,17 +642,17 @@ export class SessionRegistry {
   public getActiveSessions(): SessionState[] {
     const sessions: SessionState[] = [];
 
-    console.log(`Claude Watch: getActiveSessions() - activeSessions has ${this.activeSessions.size} entries`);
+    log(`getActiveSessions() - activeSessions has ${this.activeSessions.size} entries`);
 
     for (const [sessionId, record] of this.activeSessions) {
       if (!record.state) {
-        console.log(`Claude Watch: Session ${sessionId} has no state, skipping`);
+        log(`Session ${sessionId} has no state, skipping`);
         continue;
       }
 
       // Filter by workspace
       if (this.workspacePath && !cwdEquals(record.state.cwd, this.workspacePath)) {
-        console.log(`Claude Watch: Session ${sessionId} CWD ${record.state.cwd} doesn't match workspace ${this.workspacePath}`);
+        log(`Session ${sessionId} CWD ${record.state.cwd} doesn't match workspace ${this.workspacePath}`);
         continue;
       }
 
@@ -753,16 +665,13 @@ export class SessionRegistry {
       // Compute effective status using multiple signals
       let effectiveStatus = record.state.status;
 
-      // Signal 1: Hook says tool is running → definitely WORKING
+      // Signal 1: Hook says tool is running -> definitely WORKING
       if (record.currentTool) {
         effectiveStatus = SessionStatus.WORKING;
       }
-      // Signal 2: In-progress todo → Claude is actively working
-      else if (record.state.todos?.some(t => t.status === 'in_progress')) {
-        effectiveStatus = SessionStatus.WORKING;
-      }
-      // Signal 3: Recent file modification → likely still working
-      else if (Date.now() - record.state.lastModified < ACTIVITY_THRESHOLD_MS) {
+      // Signal 2: In-progress todo -> Claude is actively working (only if transcript isn't explicitly DONE)
+      else if (record.state.status !== SessionStatus.DONE &&
+               record.state.todos?.some(t => t.status === 'in_progress')) {
         effectiveStatus = SessionStatus.WORKING;
       }
       // Otherwise: use transcript-derived status (DONE or PAUSED)
@@ -771,7 +680,7 @@ export class SessionRegistry {
       sessions.push({ ...record.state, status: effectiveStatus });
     }
 
-    console.log(`Claude Watch: getActiveSessions() returning ${sessions.length} sessions`);
+    log(`getActiveSessions() returning ${sessions.length} sessions`);
     // Sort by created time (most recent first)
     return sessions.sort((a, b) => b.created - a.created);
   }
@@ -843,80 +752,22 @@ export class SessionRegistry {
       return undefined;
     }
 
-    // Collect terminal PIDs for logging
-    const terminalPids: number[] = [];
-    for (const terminal of vscode.window.terminals) {
-      try {
-        const pid = await terminal.processId;
-        if (pid) terminalPids.push(pid);
-      } catch {
-        // ignore
+    const terminal = await this.terminalLinker.findTerminalByPid(
+      record.ppid,
+      record.pid,
+      (newPpid) => {
+        this.ppidIndex.delete(record.ppid);
+        record.ppid = newPpid;
+        this.ppidIndex.set(newPpid, sessionId);
+        log(`findTerminalForSession: updated PPID for session ${sessionId}`);
       }
+    );
+
+    if (terminal) {
+      log(`findTerminalForSession: found terminal for session ${sessionId}`);
     }
 
-    // First, try direct PPID lookup (works when hook registered the session)
-    for (const terminal of vscode.window.terminals) {
-      const terminalPid = await terminal.processId;
-      if (terminalPid === record.ppid) {
-        log(`findTerminalForSession: found via direct PPID match for session ${sessionId}`);
-        return terminal;
-      }
-    }
-
-    // Fallback: search for terminal that has Claude (record.pid) as a descendant
-    // This handles VS Code reload case where terminal.processId changed
-    if (record.pid) {
-      try {
-        // Get the full ancestor chain of the Claude process
-        const ancestorPids = await this.getProcessAncestors(record.pid);
-
-        for (const terminal of vscode.window.terminals) {
-          const terminalPid = await terminal.processId;
-          if (terminalPid && ancestorPids.has(terminalPid)) {
-            // Update the record with the correct PPID for future lookups
-            this.ppidIndex.delete(record.ppid);
-            record.ppid = terminalPid;
-            this.ppidIndex.set(terminalPid, sessionId);
-            log(`findTerminalForSession: found via ancestor search for session ${sessionId}`);
-            return terminal;
-          }
-        }
-
-        // Log failure with details
-        log(`findTerminalForSession FAILED for session ${sessionId}: ppid=${record.ppid}, pid=${record.pid}, ancestors=[${[...ancestorPids].join(',')}], terminalPids=[${terminalPids.join(',')}]`);
-      } catch (err) {
-        log(`findTerminalForSession error for session ${sessionId}: ${err}`);
-      }
-    } else {
-      log(`findTerminalForSession FAILED for session ${sessionId}: ppid=${record.ppid}, no pid in record`);
-    }
-
-    return undefined;
-  }
-
-  /**
-   * Get all ancestor PIDs of a process (non-blocking)
-   */
-  private async getProcessAncestors(pid: number): Promise<Set<number>> {
-    const ancestors = new Set<number>();
-    try {
-      let currentPid = pid;
-      for (let i = 0; i < 10; i++) { // Max 10 levels to avoid infinite loop
-        const { stdout } = await execAsync(`ps -o ppid= -p ${currentPid} 2>/dev/null | tr -d ' '`);
-        const ppid = stdout.trim();
-
-        if (!ppid || ppid === "0" || ppid === "1") break;
-
-        const ppidNum = parseInt(ppid, 10);
-        if (isNaN(ppidNum) || ancestors.has(ppidNum)) break;
-
-        ancestors.add(ppidNum);
-        currentPid = ppidNum;
-      }
-    } catch {
-      // Ignore errors
-    }
-    return ancestors;
+    return terminal;
   }
 
   /**
@@ -968,7 +819,7 @@ export class SessionRegistry {
         if (!state && record.transcriptPath) {
           // Force re-parse by clearing mtime cache
           this.fileLastModified.delete(record.transcriptPath);
-          state = parseTranscript(record.transcriptPath);
+          state = await parseTranscript(record.transcriptPath);
         }
 
         // Move to inactive (for "Old Sessions" view)
@@ -1018,8 +869,10 @@ export class SessionRegistry {
     }
 
     this.debounceTimer = setTimeout(() => {
-      // Recheck orphaned agents
-      this.recheckOrphanedAgents();
+      // Recheck orphaned agents (fire-and-forget async)
+      this.recheckOrphanedAgents().catch((err) => {
+        log(`Error rechecking orphaned agents: ${err}`);
+      });
 
       // Prevent memory leak from unbounded inactive session storage
       this.trimInactiveSessions();
@@ -1033,13 +886,36 @@ export class SessionRegistry {
     }, DEBOUNCE_MS);
   }
 
+  /**
+   * Debounced file change handler - coalesces rapid file system events per-file
+   */
+  private debouncedFileChange(uri: vscode.Uri): void {
+    const filePath = uri.fsPath;
+
+    // Clear existing timer for this file
+    const existingTimer = this.fileChangeTimers.get(filePath);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    // Set new debounced timer
+    const timer = setTimeout(() => {
+      this.fileChangeTimers.delete(filePath);
+      this.handleFileChange(uri).catch((err) => {
+        log(`Error handling file change for ${filePath}: ${err}`);
+      });
+    }, FILE_CHANGE_DEBOUNCE_MS);
+
+    this.fileChangeTimers.set(filePath, timer);
+  }
+
   private async handleFileChange(uri: vscode.Uri): Promise<void> {
     const filePath = uri.fsPath;
 
     // Skip if already parsing
     if (this.parsingFiles.has(filePath)) return;
 
-    this.parseAndUpdateSession(filePath);
+    await this.parseAndUpdateSession(filePath);
   }
 
   private handleFileDelete(uri: vscode.Uri): void {
@@ -1061,18 +937,18 @@ export class SessionRegistry {
     this.notifyUpdate();
   }
 
-  private parseAndUpdateSession(filePath: string): void {
+  private async parseAndUpdateSession(filePath: string): Promise<void> {
     // Check mtime to skip unchanged files
     try {
-      const stats = fs.statSync(filePath);
+      const stats = await fs.promises.stat(filePath);
       const lastMtime = this.fileLastModified.get(filePath);
       if (lastMtime && stats.mtimeMs <= lastMtime) {
-        console.log(`Claude Watch: Skipping unchanged file ${filePath}`);
+        log(`Skipping unchanged file ${filePath}`);
         return;
       }
       this.fileLastModified.set(filePath, stats.mtimeMs);
     } catch (err) {
-      console.log(`Claude Watch: Error statting file ${filePath}:`, err);
+      log(`Error statting file ${filePath}: ${err}`);
       return;
     }
 
@@ -1080,14 +956,14 @@ export class SessionRegistry {
     this.parsingFiles.add(filePath);
 
     try {
-      const state = parseTranscript(filePath);
+      const state = await parseTranscript(filePath);
       if (!state) {
-        console.log(`Claude Watch: parseTranscript returned null for ${filePath}`);
+        log(`parseTranscript returned null for ${filePath}`);
         this.parsingFiles.delete(filePath);
         return;
       }
 
-      console.log(`Claude Watch: Parsed ${filePath} -> sessionId=${state.sessionId}, isAgent=${state.isAgent}`);
+      log(`Parsed ${filePath} -> sessionId=${state.sessionId}, isAgent=${state.isAgent}`);
 
       // Handle agent orphaning
       if (state.isAgent && state.parentSessionId) {
@@ -1117,13 +993,13 @@ export class SessionRegistry {
     }
   }
 
-  private recheckOrphanedAgents(): void {
+  private async recheckOrphanedAgents(): Promise<void> {
     for (const [filePath, parentId] of this.orphanedAgents) {
       const parentRecord = this.activeSessions.get(parentId);
       if (parentRecord) {
         // Parent is now available, re-parse
         this.orphanedAgents.delete(filePath);
-        this.parseAndUpdateSession(filePath);
+        await this.parseAndUpdateSession(filePath);
       }
     }
   }
@@ -1153,13 +1029,13 @@ export class SessionRegistry {
         for (const file of sortedFiles) {
           if (!file.endsWith(".jsonl")) continue;
           const filePath = path.join(projectPath, file);
-          this.parseAndUpdateSession(filePath);
+          await this.parseAndUpdateSession(filePath);
         }
       }
     } catch (err) {
       // Projects directory may not exist yet
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-        console.error("Claude Watch: Error scanning projects:", err);
+        log(`Error scanning projects: ${err}`);
       }
     }
   }

@@ -1,6 +1,13 @@
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as vscode from "vscode";
+
+function debugLog(message: string): void {
+  if (vscode.workspace.getConfiguration('claudeWatch').get<boolean>('debug', false)) {
+    console.log(`Claude Watch: ${message}`);
+  }
+}
 
 const HOOK_SCRIPT_NAME = "claude-watch.sh";
 const HOOK_SCRIPT_VERSION = "3"; // Increment when hook script changes - v3 adds tool hooks
@@ -100,7 +107,7 @@ export async function configureHooks(): Promise<{ success: boolean; error?: stri
 
     // Write hook script
     fs.writeFileSync(hookScriptPath, HOOK_SCRIPT, { mode: 0o755 });
-    console.log(`Claude Watch: Wrote hook script to ${hookScriptPath}`);
+    debugLog(`Wrote hook script to ${hookScriptPath}`);
 
     // Read existing settings or create new
     let settings: Record<string, unknown> = {};
@@ -185,7 +192,7 @@ export async function configureHooks(): Promise<{ success: boolean; error?: stri
 
     // Write updated settings
     fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
-    console.log(`Claude Watch: Updated settings.json with hook configuration`);
+    debugLog(`Updated settings.json with hook configuration`);
 
     return { success: true };
   } catch (err) {
@@ -214,7 +221,7 @@ export function areHooksConfigured(): boolean {
     const scriptContent = fs.readFileSync(hookScriptPath, "utf-8");
     const versionMatch = scriptContent.match(/# VERSION: (\d+)/);
     if (!versionMatch || versionMatch[1] !== HOOK_SCRIPT_VERSION) {
-      console.log(`Claude Watch: Hook script version mismatch, needs update`);
+      debugLog(`Hook script version mismatch, needs update`);
       return false;
     }
 

@@ -27,7 +27,7 @@ const FIRST_MESSAGE_TRUNCATE_LENGTH = 50; // Max length for first user message d
  * Strategy: Return the folder name as-is (encoded form) and let the caller
  * match against known CWDs using encodePathForClaude().
  */
-function deriveCwdFromPath(filePath: string): string {
+async function deriveCwdFromPath(filePath: string): Promise<string> {
   // Extract project folder name from path like:
   // ~/.claude/projects/-Users-billywu-claude-watch/session.jsonl
   const projectsDir = path.join(os.homedir(), ".claude", "projects");
@@ -46,11 +46,10 @@ function deriveCwdFromPath(filePath: string): string {
 
   // Check if the path exists - if so, use it
   try {
-    if (fs.existsSync(naiveDecode)) {
-      return naiveDecode;
-    }
+    await fs.promises.access(naiveDecode);
+    return naiveDecode;
   } catch {
-    // Ignore errors
+    // Path doesn't exist, continue searching
   }
 
   // If naive decode doesn't exist, try to find a valid path by checking
@@ -67,11 +66,10 @@ function deriveCwdFromPath(filePath: string): string {
     ];
     const candidate = "/" + pathParts.join("/");
     try {
-      if (fs.existsSync(candidate)) {
-        return candidate;
-      }
+      await fs.promises.access(candidate);
+      return candidate;
     } catch {
-      // Ignore errors
+      // Path doesn't exist, continue
     }
   }
 
@@ -152,36 +150,36 @@ export interface TodoItem {
   status: string;
 }
 
-export function parseTranscript(filePath: string): SessionState | null {
+export async function parseTranscript(filePath: string): Promise<SessionState | null> {
   try {
-    const stats = fs.statSync(filePath);
+    const stats = await fs.promises.stat(filePath);
 
     let content: string;
 
     if (stats.size > LARGE_FILE_THRESHOLD_BYTES) {
       // For large files, read from start (for metadata) and end (for current state)
       // Issue 7: Re-stat the file after opening to get accurate size during active writes
-      const fd = fs.openSync(filePath, "r");
+      const handle = await fs.promises.open(filePath, "r");
       try {
         // Re-stat to get current size (file may have grown since initial stat)
-        const currentStats = fs.fstatSync(fd);
+        const currentStats = await handle.stat();
         const currentSize = currentStats.size;
 
         // Read start for metadata (sessionId, cwd, etc.)
         const startBuffer = Buffer.alloc(LARGE_FILE_CHUNK_SIZE_BYTES);
-        fs.readSync(fd, startBuffer, 0, LARGE_FILE_CHUNK_SIZE_BYTES, 0);
+        await handle.read(startBuffer, 0, LARGE_FILE_CHUNK_SIZE_BYTES, 0);
 
         // Read end for current state - use current size for accurate positioning
         const endBuffer = Buffer.alloc(LARGE_FILE_CHUNK_SIZE_BYTES);
         const endPosition = Math.max(0, currentSize - LARGE_FILE_CHUNK_SIZE_BYTES);
-        fs.readSync(fd, endBuffer, 0, LARGE_FILE_CHUNK_SIZE_BYTES, endPosition);
+        await handle.read(endBuffer, 0, LARGE_FILE_CHUNK_SIZE_BYTES, endPosition);
 
         content = startBuffer.toString("utf-8") + "\n" + endBuffer.toString("utf-8");
       } finally {
-        fs.closeSync(fd);
+        await handle.close();
       }
     } else {
-      content = fs.readFileSync(filePath, "utf-8");
+      content = await fs.promises.readFile(filePath, "utf-8");
     }
 
     const lines = content.trim().split("\n").filter((l) => l.trim());
@@ -190,7 +188,7 @@ export function parseTranscript(filePath: string): SessionState | null {
     if (lines.length === 0) {
       const fileName = path.basename(filePath, ".jsonl");
       const isAgent = fileName.startsWith("agent-");
-      const derivedCwd = deriveCwdFromPath(filePath);
+      const derivedCwd = await deriveCwdFromPath(filePath);
       const defaultTokenUsage: TokenUsage = {
         contextTokens: 0,
         maxContextTokens: MODEL_CONTEXT_WINDOWS.default,
@@ -421,7 +419,7 @@ export function parseTranscript(filePath: string): SessionState | null {
     const effectiveSessionId = isAgent ? agentId : sessionId;
 
     // Fallback: derive cwd from file path if not found in transcript
-    const effectiveCwd = cwd || deriveCwdFromPath(filePath);
+    const effectiveCwd = cwd || await deriveCwdFromPath(filePath);
 
     // Get max context window for the model
     const maxContextTokens = MODEL_CONTEXT_WINDOWS[modelName] || MODEL_CONTEXT_WINDOWS.default;

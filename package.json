@@ -64,6 +64,21 @@
         "command": "claude-watch.renameSession",
         "title": "Rename Session",
         "icon": "$(edit)"
+      },
+      {
+        "command": "claude-watch.expandAll",
+        "title": "Expand All",
+        "icon": "$(expand-all)"
+      },
+      {
+        "command": "claude-watch.collapseAll",
+        "title": "Collapse All",
+        "icon": "$(collapse-all)"
+      },
+      {
+        "command": "claude-watch.closeSession",
+        "title": "Close Session",
+        "icon": "$(close)"
       }
     ],
     "viewsContainers": {
@@ -86,6 +101,16 @@
     },
     "menus": {
       "view/title": [
+        {
+          "command": "claude-watch.expandAll",
+          "when": "view == claudeSessions",
+          "group": "navigation@0"
+        },
+        {
+          "command": "claude-watch.collapseAll",
+          "when": "view == claudeSessions",
+          "group": "navigation@0"
+        },
         {
           "command": "claude-watch.newSession",
           "when": "view == claudeSessions",
@@ -112,6 +137,11 @@
           "command": "claude-watch.pinSession",
           "when": "view == claudeSessions && viewItem =~ /claudeSession|claudeAgent/",
           "group": "inline@2"
+        },
+        {
+          "command": "claude-watch.closeSession",
+          "when": "view == claudeSessions && viewItem =~ /claudeSession|claudeAgent/",
+          "group": "inline@3"
         },
         {
           "command": "claude-watch.resumeSession",
@@ -151,6 +181,11 @@
           "minimum": 1,
           "maximum": 60,
           "description": "Minutes of inactivity before a working session is marked as stalled"
+        },
+        "claudeWatch.debug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable debug logging to console and output channel"
         }
       }
     }
