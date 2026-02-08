@@ -190,20 +190,20 @@ export class TodoListItem extends vscode.TreeItem {
 export class SessionItem extends vscode.TreeItem {
   public session: SessionState;
 
-  constructor(session: SessionState, hasChildren: boolean = false, isPinned: boolean = false, alias?: string, lastActivityTime?: number) {
+  constructor(session: SessionState, hasChildren: boolean = false, isPinned: boolean = false, alias?: string) {
     super("", vscode.TreeItemCollapsibleState.None);
     this.session = session;
     // Stable ID for consistent tree rendering across refreshes
     this.id = session.filePath;
-    this.applySessionData(session, hasChildren, isPinned, alias, lastActivityTime);
+    this.applySessionData(session, hasChildren, isPinned, alias);
   }
 
-  updateFromSession(session: SessionState, hasChildren: boolean, isPinned: boolean = false, alias?: string, lastActivityTime?: number): void {
+  updateFromSession(session: SessionState, hasChildren: boolean, isPinned: boolean = false, alias?: string): void {
     this.session = session;
-    this.applySessionData(session, hasChildren, isPinned, alias, lastActivityTime);
+    this.applySessionData(session, hasChildren, isPinned, alias);
   }
 
-  private applySessionData(session: SessionState, hasChildren: boolean, isPinned: boolean = false, alias?: string, lastActivityTime?: number): void {
+  private applySessionData(session: SessionState, hasChildren: boolean, isPinned: boolean = false, alias?: string): void {
     const isAgent = session.isAgent;
 
     // Label: use alias if set, otherwise prefer summary, fall back to firstUserMessage then lastUserPrompt
@@ -293,26 +293,12 @@ export class SessionItem extends vscode.TreeItem {
     };
     let config = statusConfig[session.status] || { icon: "circle", color: "foreground" };
 
-    // Check if session is stalled (WORKING but no activity for > threshold)
-    const stalledThresholdMs = vscode.workspace.getConfiguration('claudeWatch').get<number>('stalledThresholdMinutes', 5) * 60 * 1000;
-    const isStalled = session.status === SessionStatus.WORKING &&
-                      lastActivityTime &&
-                      (Date.now() - lastActivityTime) > stalledThresholdMs;
-
-    if (isStalled) {
-      // Override icon for stalled sessions
-      config = { icon: "warning", color: "notificationsWarningIcon.foreground" };
-      // Add stalled time to description
-      const stalledMinutes = Math.floor((Date.now() - lastActivityTime!) / 60000);
-      this.description = `\u26a0\ufe0f Stalled ${stalledMinutes}m \u00b7 ${this.description}`;
-    }
-
     // Override color based on context usage (warning at 75%, critical at 90%)
     let iconColor = config.color;
     if (contextPct >= 90) {
       iconColor = "testing.iconFailed"; // Red - critical
-    } else if (contextPct >= 75 && !isStalled) {
-      iconColor = "notificationsWarningIcon.foreground"; // Yellow - warning (skip if already stalled)
+    } else if (contextPct >= 75) {
+      iconColor = "notificationsWarningIcon.foreground"; // Yellow - warning
     }
     this.iconPath = new vscode.ThemeIcon(config.icon, new vscode.ThemeColor(iconColor));
 

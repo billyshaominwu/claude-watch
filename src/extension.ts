@@ -120,7 +120,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       terminal.show();
-      terminal.sendText("claude");
+      const claudeCmd = vscode.workspace.getConfiguration("claudeWatch").get<string>("claudeCommand", "claude");
+      terminal.sendText(claudeCmd);
     }
   );
 
@@ -175,7 +176,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       terminal.show();
-      terminal.sendText(`claude --resume ${session.sessionId}`);
+      const claudeCmd = vscode.workspace.getConfiguration("claudeWatch").get<string>("claudeCommand", "claude");
+      terminal.sendText(`${claudeCmd} --resume ${session.sessionId}`);
     }
   );
 

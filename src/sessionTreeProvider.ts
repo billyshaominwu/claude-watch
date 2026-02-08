@@ -143,13 +143,11 @@ export class SessionTreeProvider implements vscode.TreeDataProvider<TreeItemType
   private getOrCreateSessionItem(session: SessionState, hasChildren: boolean): SessionItem {
     const isPinned = this.pinnedSessions.has(session.filePath);
     const alias = this.sessionAliases.get(session.sessionId);
-    const record = this.registry.getSessionRecord(session.sessionId);
-    const lastActivityTime = record?.lastActivityTime;
     let item = this.sessionItemCache.get(session.filePath);
     if (item) {
-      item.updateFromSession(session, hasChildren, isPinned, alias, lastActivityTime);
+      item.updateFromSession(session, hasChildren, isPinned, alias);
     } else {
-      item = new SessionItem(session, hasChildren, isPinned, alias, lastActivityTime);
+      item = new SessionItem(session, hasChildren, isPinned, alias);
       this.sessionItemCache.set(session.filePath, item);
     }
     return item;

@@ -677,7 +677,9 @@ export class SessionRegistry {
       // Otherwise: use transcript-derived status (DONE or PAUSED)
 
       // Push state with effective status
-      sessions.push({ ...record.state, status: effectiveStatus });
+      // Use the map key (real sessionId from hook) instead of record.state.sessionId
+      // This handles empty files where parseTranscript returns filename as sessionId
+      sessions.push({ ...record.state, sessionId, status: effectiveStatus });
     }
 
     log(`getActiveSessions() returning ${sessions.length} sessions`);

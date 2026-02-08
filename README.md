@@ -1,121 +1,127 @@
-# Claude Watch
+# Claude Watch : Multi Claude Session Manager
 
-A VS Code extension that monitors your Claude Code CLI sessions. See what each terminal is working on at a glance.
+[![VS Code Marketplace](https://img.shields.io/visual-studio-marketplace/v/billywu.claude-watch)](https://marketplace.visualstudio.com/items?itemName=billywu.claude-watch)
+
+**Monitor and manage all your Claude Code sessions from a single VS Code sidebar.**
+
+VS Code terminals are great for running Claude, but you can't tell which session is doing what, whether it's waiting for input, or how close it is to hitting context limits. Claude Watch fixes this by giving you deep visibility into every session: real-time status, context usage, todo progress, and instant recall of any session with a single click.
+
+![Claude Watch Screenshot](images/screenshot.png)
+
+## Why Claude Watch?
+
+When you're running multiple Claude sessions across terminals, you lose track fast:
+- Which terminal is running which prompt?
+- Is that session working, or has it been waiting for input for 20 minutes?
+- How much context does each session have left?
+- What has each session actually accomplished?
+- Which parallel subagents or tools is each session currently using?
+- How many tokens have I used?
+
+Claude Watch gives you a dashboard tree view of all your sessions with the details that matter, so you can monitor progress and jump to any session instantly.
 
 ## Features
 
-- **Session Sidebar**: View all active Claude sessions in a dedicated panel with Active/Old categories
-- **Real-time Status**: Three states - Working (spinning), Paused (question asked), Done (task complete)
-- **Context Window Display**: Visual progress bar showing token usage with cache hit rate
-- **Task Tracking**: Shows in-progress tasks from TodoWrite with completion counts
-- **Todo List View**: Expandable session nodes showing individual todo items
-- **Agent Tracking**: Nested view of agent sub-sessions under parent sessions
-- **Session Pinning**: Pin important sessions to keep them at the top
-- **Session Resume**: Resume old sessions directly from the sidebar
-- **Quick Navigation**: Click any session to jump to its terminal
-- **Session Summaries**: Shows Claude-generated summaries when available
-- **Workspace Filtering**: Only shows sessions for the current VS Code workspace
+- **Session Overview** - All active sessions in one panel with descriptive labels showing what each is working on
+- **Real-time Status** - Instantly see which sessions are working, waiting for input, or done
+- **Context Window Tracking** - Visual progress bars show token usage and cache hit rates
+- **Todo Visibility** - See in-progress tasks and completion counts; expand to view full todo lists
+- **Instant Recall** - Click any session to jump straight to its terminal
+- **Agent Tracking** - Spawned agents appear nested under their parent sessions
+- **Session Pinning** - Pin important sessions to keep them at the top
+- **Resume Old Sessions** - Browse and resume past sessions from the sidebar
+- **Workspace Filtering** - Only shows sessions for your current VS Code workspace
 
 ## Installation
 
-### From VSIX (Local)
-
-```bash
-# Build and install
-npm install
-npm run install-ext
-
-# Or manually:
-npm run compile
-npm run package
-code --install-extension claude-watch-0.1.0.vsix
-```
-
-### From Source
-
-1. Clone this repository
-2. Run `npm install`
-3. Press F5 in VS Code to launch Extension Development Host
+1. Open VS Code
+2. Go to Extensions (Ctrl+Shift+X / Cmd+Shift+X)
+3. Search for "Claude Watch"
+4. Click Install
 
 ## Usage
 
 1. Open the Claude Watch panel from the activity bar (chat bubble icon)
-2. Start Claude sessions in your terminals - they'll appear automatically
-3. Click a session to open its terminal
+2. Start Claude sessions in your terminals—they appear automatically
+3. Click a session to jump to its terminal
 4. Expand a session to see context usage and todo items
-5. Use the refresh button to manually update the list
 
 ### Session Display
 
-- **Label**: Shows session summary, first user message, or last prompt
-- **Description**: Current in-progress task with completion count (e.g., "3/5")
-- **Tooltip**: Hover for details including status, project, context usage, path, and session ID
+Each session in the tree shows:
 
-### Session Status Icons
+| Element | Description |
+|---------|-------------|
+| **Label** | Session summary, first user message, or custom alias you set |
+| **Description** | Current in-progress task with completion count (e.g., "3/5") |
+| **Status icon** | Visual indicator of session state (see below) |
+| **Context warning** | Icon turns yellow at 75% context, red at 90% |
 
-- **Spinning sync icon** (blue): Claude is working (executing tools)
-- **Pause icon** (yellow): Claude asked a question, waiting for input
-- **Check icon** (green): Claude completed the task
+Hover over any session for a tooltip with full details: status, context stats, current task, working directory, and session ID.
 
-### Context Info (Expandable)
+### Status Icons
 
-- Visual progress bar with percentage
-- Token usage: current/max with cache hit rate
-- Output tokens count
+| Icon | Color | Status |
+|------|-------|--------|
+| Spinning sync | Blue | Working—Claude is executing tools |
+| Pause | Yellow | Paused—waiting for your input |
+| Check | Green | Done—task completed |
 
-### Tree View Actions
+### Toolbar Buttons
 
-- **+ button**: Start a new Claude session
-- **Refresh button**: Manually refresh session list
-- **Terminal icon**: Open terminal for session (inline)
-- **Pin icon**: Pin/unpin session to top (inline)
-- **Play icon**: Resume old session (inline, on Old sessions)
+| Button | Action |
+|--------|--------|
+| Expand All | Expand all sessions to show details |
+| Collapse All | Collapse all sessions |
+| + | Start a new Claude session |
+| Refresh | Refresh the session list |
+| ⚙ Settings | Open extension settings |
 
-## How It Works
+### Session Actions
 
-Claude Watch monitors `~/.claude/projects/` for session transcript files (JSONL format). It uses system commands (`ps`, `lsof`) to detect running Claude processes and match them to VS Code terminals.
+**Inline buttons** (visible on hover):
 
-### Session-to-Process Mapping
+| Button | Action |
+|--------|--------|
+| Terminal | Jump to the session's terminal |
+| Pin | Pin session to the top of the list |
+| ✕ Close | Remove from active sessions |
 
-Sessions are associated with Claude processes using multiple strategies:
-1. **lsof lookup**: Find the process that has the session file open (most reliable)
-2. **Single process match**: If only one Claude process in the CWD, use it
-3. **Temporal matching**: Match by closest start time between session and process
-4. **Pending retry**: Queue for later if no process found yet
+**Right-click menu**:
 
-Mappings are persisted to VS Code workspace state and validated against running processes.
+| Action | Description |
+|--------|-------------|
+| Copy Resume Command | Copy `claude --resume <id>` to clipboard |
+| View Transcript | Open the raw JSONL transcript file |
+| Rename Session | Set a custom alias for this session |
 
-### Active vs Old Sessions
+### Old Sessions
 
-**Active sessions** require:
-- A Claude process running in the session's CWD
-- The session must be among the N most recent (N = number of Claude processes in that directory)
+Past sessions appear in a collapsible "Old Sessions" section:
+- Shows how long ago each session was active (e.g., "2h ago")
+- Click the ▶ Play button to resume a session
+- Right-click to copy resume command or view transcript
 
-**Old sessions** are inactive sessions that can be resumed:
-- No running Claude process
-- Have a displayable user prompt
-- Click to resume with `claude --resume <sessionId>`
+### Expandable Details
 
-### Agent Sessions
-
-Agent sessions (spawned via Task tool) are nested under their parent and only shown when:
-- The parent session is active
-- The agent has real activity (not just warmup messages)
+Click the arrow next to any active session to reveal:
+- **Context Info** — Progress bar with token usage, cache hit rate, and output tokens
+- **Todo List** — Individual todo items showing pending, in-progress, or completed status
 
 ## Requirements
 
 - VS Code 1.85.0 or higher
-- macOS or Linux (uses `ps` and `lsof` for process detection)
-- Claude Code CLI installed
+- macOS or Linux
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code) installed
 
-## Development
+## Configuration
 
-```bash
-npm run compile   # Build TypeScript
-npm run watch     # Watch mode for development
-npm run package   # Create .vsix package
-```
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `claudeWatch.maxOldSessions` | 100 | Maximum old sessions to display |
+| `claudeWatch.claudeCommand` | `claude` | Command to start Claude |
+| `claudeWatch.debug` | false | Enable debug logging |
 
 ## License
 
-MIT
+MIT License. See [LICENSE](LICENSE) for details.

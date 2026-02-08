@@ -8,6 +8,7 @@
     "type": "git",
     "url": "https://github.com/billywu/claude-watch"
   },
+  "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -175,17 +176,15 @@
           "maximum": 500,
           "description": "Maximum number of old sessions to display in the tree view"
         },
-        "claudeWatch.stalledThresholdMinutes": {
-          "type": "number",
-          "default": 5,
-          "minimum": 1,
-          "maximum": 60,
-          "description": "Minutes of inactivity before a working session is marked as stalled"
-        },
         "claudeWatch.debug": {
           "type": "boolean",
           "default": false,
           "description": "Enable debug logging to console and output channel"
+        },
+        "claudeWatch.claudeCommand": {
+          "type": "string",
+          "default": "claude",
+          "description": "Command to start Claude (e.g., 'claude', 'claude --dangerously-skip-permissions')"
         }
       }
     }
