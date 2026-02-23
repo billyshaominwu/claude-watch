@@ -10,7 +10,7 @@ function debugLog(message: string): void {
 }
 
 const HOOK_SCRIPT_NAME = "claude-watch.sh";
-const HOOK_SCRIPT_VERSION = "3"; // Increment when hook script changes - v3 adds tool hooks
+const HOOK_SCRIPT_VERSION = "5"; // Increment when hook script changes - v5 fixes jq path for macOS
 
 /**
  * The hook script that Claude Code will execute.
@@ -38,8 +38,8 @@ fi
 #   $PPID = Claude's PID
 #   We need Claude's PPID = terminal shell PID (for VS Code terminal matching)
 CLAUDE_PID=$PPID
-TERMINAL_PID=$(ps -o ppid= -p $CLAUDE_PID 2>/dev/null | tr -d ' ')
-TTY_VAL=$(tty 2>/dev/null) || TTY_VAL="none"
+TERMINAL_PID=$(/bin/ps -o ppid= -p $CLAUDE_PID 2>/dev/null | /usr/bin/tr -d ' ')
+TTY_VAL=$(/usr/bin/tty 2>/dev/null) || TTY_VAL="none"
 
 # Build JSON message based on event type
 if [ "$EVENT" = "PreToolUse" ] || [ "$EVENT" = "PostToolUse" ]; then
@@ -47,7 +47,7 @@ if [ "$EVENT" = "PreToolUse" ] || [ "$EVENT" = "PostToolUse" ]; then
   TOOL_NAME=$(echo "$INPUT" | jq -r '.tool_name // empty')
   TOOL_INPUT=$(echo "$INPUT" | jq -c '.tool_input // {}')
   TOOL_RESULT=$(echo "$INPUT" | jq -c '.tool_result // null')
-  TIMESTAMP=$(python3 -c "import time; print(int(time.time() * 1000))")
+  TIMESTAMP=$(/bin/date +%s)000
 
   MSG=$(jq -c -n \\
     --arg event "$EVENT" \\
@@ -80,7 +80,7 @@ PORT_FILE=~/.claude/.claude-watch-port
 if [ -f "$PORT_FILE" ]; then
   while IFS= read -r PORT || [ -n "$PORT" ]; do
     if [ -n "$PORT" ]; then
-      (echo "$MSG" | nc -w 1 localhost $PORT 2>/dev/null) &
+      (echo "$MSG" | /usr/bin/nc -w 1 localhost $PORT 2>/dev/null) &
     fi
   done < "$PORT_FILE"
 fi

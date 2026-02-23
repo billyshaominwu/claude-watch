@@ -107,6 +107,8 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
         return;
       }
 
+      const claudeCmd = vscode.workspace.getConfiguration("claudeWatch").get<string>("claudeCommand", "claude");
+
       // Create terminal and track it
       const terminal = vscode.window.createTerminal({
         name: `Claude: ${path.basename(cwd)}`,
@@ -120,8 +122,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
       }
 
       terminal.show();
-      const claudeCmd = vscode.workspace.getConfiguration("claudeWatch").get<string>("claudeCommand", "claude");
-      terminal.sendText(claudeCmd);
+
+      // Wait for shell to be ready before sending command.
+      // terminal.sendText() can race with shell profile initialization
+      // (e.g. pyenv, nvm), causing garbled input to Claude.
+      // Use shellIntegration API (VS Code 1.93+) if available, else delay.
+      const sendClaudeCmd = () => terminal.sendText(claudeCmd);
+
+      if (terminal.shellIntegration) {
+        // Shell already ready
+        sendClaudeCmd();
+      } else {
+        const listener = vscode.window.onDidChangeTerminalShellIntegration((e) => {
+          if (e.terminal === terminal) {
+            listener.dispose();
+            sendClaudeCmd();
+          }
+        });
+        // Fallback timeout in case shell integration is unavailable
+        setTimeout(() => {
+          listener.dispose();
+          if (!terminal.shellIntegration) {
+            sendClaudeCmd();
+          }
+        }, 3000);
+      }
     }
   );
 

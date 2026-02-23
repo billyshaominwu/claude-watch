@@ -134,7 +134,7 @@ export class HookServer {
         existingPorts.push(this.port);
       }
 
-      fs.writeFileSync(portFile, existingPorts.join("\n"));
+      fs.writeFileSync(portFile, existingPorts.join("\n"), { mode: 0o600 });
       debugLog(`Registered port ${this.port} (${existingPorts.length} total ports)`);
     } catch (err) {
       console.error("Claude Watch: Failed to write port file:", err);
@@ -231,7 +231,7 @@ export class HookServer {
           .filter((p) => !isNaN(p) && p > 0 && p !== this.port);
 
         if (ports.length > 0) {
-          fs.writeFileSync(portFile, ports.join("\n"));
+          fs.writeFileSync(portFile, ports.join("\n"), { mode: 0o600 });
         } else {
           fs.unlinkSync(portFile);
         }

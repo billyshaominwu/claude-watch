@@ -297,6 +297,10 @@ export class SessionRegistry {
    * Returns a string like "Fri Dec 20 10:30:00 2024" that uniquely identifies the process instance
    */
   private async getProcessStartTime(pid: number): Promise<string | null> {
+    // Validate PID is a safe integer (max PID on Linux is 4194304, macOS is 99999)
+    if (!Number.isInteger(pid) || pid < 0 || pid > 4194304) {
+      return null;
+    }
     try {
       const { stdout } = await execAsync(`ps -p ${pid} -o lstart= 2>/dev/null`);
       const startTime = stdout.trim();

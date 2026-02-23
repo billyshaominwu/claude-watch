@@ -305,6 +305,10 @@ export class TerminalLinker {
    */
   public async getProcessAncestors(pid: number): Promise<Set<number>> {
     const ancestors = new Set<number>();
+    // Validate PID is a safe integer (max PID on Linux is 4194304, macOS is 99999)
+    if (!Number.isInteger(pid) || pid < 0 || pid > 4194304) {
+      return ancestors;
+    }
     try {
       let currentPid = pid;
       for (let i = 0; i < 10; i++) { // Max 10 levels to avoid infinite loop
@@ -314,7 +318,7 @@ export class TerminalLinker {
         if (!ppidStr || ppidStr === "0" || ppidStr === "1") break;
 
         const ppidNum = parseInt(ppidStr, 10);
-        if (isNaN(ppidNum) || ancestors.has(ppidNum)) break;
+        if (isNaN(ppidNum) || ppidNum < 0 || ppidNum > 4194304 || ancestors.has(ppidNum)) break;
 
         ancestors.add(ppidNum);
         currentPid = ppidNum;
